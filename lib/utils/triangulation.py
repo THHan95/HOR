@@ -2,6 +2,38 @@ import numpy as np
 import torch
 
 
+def _triangulation_work_dtype(*tensors):
+    for tensor in tensors:
+        if torch.is_tensor(tensor) and tensor.dtype in (torch.float16, torch.bfloat16):
+            return torch.float32
+    for tensor in tensors:
+        if torch.is_tensor(tensor) and tensor.is_floating_point():
+            return tensor.dtype
+    return torch.float32
+
+
+def _solve_dlt_inhomogeneous(A, reg=1e-4):
+    """Solve DLT with x4 fixed to 1 via regularized least squares.
+
+    The classic homogeneous SVD solution is numerically fragile in backward when the
+    smallest singular values become close, which is common early in training. For hand
+    reconstruction we only need finite 3D points in front of the camera, so the
+    inhomogeneous least-squares form is a better fit and yields a stable gradient.
+    """
+    lhs = A[..., :3]
+    rhs = -A[..., 3:]
+    solve_dtype = lhs.dtype
+    lhs_t = lhs.transpose(-1, -2)
+    normal = torch.matmul(lhs_t, lhs).to(dtype=solve_dtype)
+    rhs_normal = torch.matmul(lhs_t, rhs).to(dtype=solve_dtype)
+
+    eye = torch.eye(3, device=A.device, dtype=solve_dtype).unsqueeze(0).expand(normal.shape[0], -1, -1)
+    scale = normal.diagonal(dim1=-2, dim2=-1).sum(dim=-1, keepdim=True).unsqueeze(-1)
+    reg_term = eye * (reg * scale.clamp_min(1.0))
+    solution = torch.linalg.solve(normal + reg_term, rhs_normal)
+    return solution.squeeze(-1)
+
+
 def batch_triangulate_dlt_torch_sigma(kp2ds, Ks, Extrs, sigmas=None):
     """torch: Triangulate multiple 2D points from multiple sets of multiviews using the DLT algorithm.
     NOTE: Expend to Batch and nJoints dimension. Supports Weighted Triangulation based on sigmas.
@@ -19,6 +51,13 @@ def batch_triangulate_dlt_torch_sigma(kp2ds, Ks, Extrs, sigmas=None):
     Returns:
         torch.Tensor: Shape: (B, J, 3).
     """
+    work_dtype = _triangulation_work_dtype(kp2ds, Ks, Extrs, sigmas)
+    kp2ds = kp2ds.to(dtype=work_dtype)
+    Ks = Ks.to(dtype=work_dtype)
+    Extrs = Extrs.to(dtype=work_dtype)
+    if sigmas is not None:
+        sigmas = sigmas.to(dtype=work_dtype)
+
     nJoints = kp2ds.shape[-2]
     batch_size = kp2ds.shape[0]
     nCams = kp2ds.shape[1]
@@ -60,11 +99,7 @@ def batch_triangulate_dlt_torch_sigma(kp2ds, Ks, Extrs, sigmas=None):
 
     A = A.reshape(batch_size * nJoints, -1, 4)  # (BxJ, 2xN, 4)
 
-    # 3. 使用 SVD 求解 A * X = 0
-    U, D, VT = torch.linalg.svd(A)  # VT: (BxJ, 4, 4)
-
-    # 取最小奇异值对应的奇异向量，并做齐次坐标归一化
-    X = VT[:, -1, :3] / (VT[:, -1, 3:] + 1e-7)  # (BxJ, 3)
+    X = _solve_dlt_inhomogeneous(A)
     X = X.reshape(batch_size, nJoints, 3)  # (B, J, 3)
 
     return X
@@ -87,6 +122,13 @@ def batch_triangulate_dlt_torch_confidence(kp2ds, Ks, Extrs, confidences=None):
     Returns:
         torch.Tensor: Shape: (B, J, 3).
     """
+    work_dtype = _triangulation_work_dtype(kp2ds, Ks, Extrs, confidences)
+    kp2ds = kp2ds.to(dtype=work_dtype)
+    Ks = Ks.to(dtype=work_dtype)
+    Extrs = Extrs.to(dtype=work_dtype)
+    if confidences is not None:
+        confidences = confidences.to(dtype=work_dtype)
+
     nJoints = kp2ds.shape[-2]
     batch_size = kp2ds.shape[0]
     nCams = kp2ds.shape[1]
@@ -132,11 +174,7 @@ def batch_triangulate_dlt_torch_confidence(kp2ds, Ks, Extrs, confidences=None):
 
     A = A.reshape(batch_size * nJoints, -1, 4)  # (BxJ, 2xN, 4)
 
-    # 3. 使用 SVD 求解 A * X = 0
-    U, D, VT = torch.linalg.svd(A)  # VT: (BxJ, 4, 4)
-
-    # 取最小奇异值对应的奇异向量，并做齐次坐标归一化
-    X = VT[:, -1, :3] / (VT[:, -1, 3:] + 1e-7)  # (BxJ, 3)
+    X = _solve_dlt_inhomogeneous(A)
     X = X.reshape(batch_size, nJoints, 3)  # (B, J, 3)
 
     return X
@@ -163,6 +201,11 @@ def batch_triangulate_dlt_torch(kp2ds, Ks, Extrs):
     # assert Ks.shape[-2:] == (3, 3), "K must be 3x3"
     # assert Extrs.shape[-2:] == (4, 4), "Extr must be 4x4"
 
+    work_dtype = _triangulation_work_dtype(kp2ds, Ks, Extrs)
+    kp2ds = kp2ds.to(dtype=work_dtype)
+    Ks = Ks.to(dtype=work_dtype)
+    Extrs = Extrs.to(dtype=work_dtype)
+
     nJoints = kp2ds.shape[-2]
     batch_size = kp2ds.shape[0]
     nCams = kp2ds.shape[1]
@@ -179,8 +222,7 @@ def batch_triangulate_dlt_torch(kp2ds, Ks, Extrs):
     A = A - Mmat[..., :2, :]  # (BxJ, N, 2, 4)
     A = A.reshape(batch_size * nJoints, -1, 4)  # (BxJ, 2xN, 4)
 
-    U, D, VT = torch.linalg.svd(A)  # VT: (BxJ, 4, 4)
-    X = VT[:, -1, :3] / (VT[:, -1, 3:] + 1e-7)  # (BxJ, 3) # normalize
+    X = _solve_dlt_inhomogeneous(A)
     X = X.reshape(batch_size, nJoints, 3)  # (B, J, 3)
     return X
 
@@ -200,6 +242,11 @@ def triangulate_dlt_torch(kp2ds, Ks, Extrs):
     Returns:
         torch.Tensor: Shape: (J, 3).
     """
+    work_dtype = _triangulation_work_dtype(kp2ds, Ks, Extrs)
+    kp2ds = kp2ds.to(dtype=work_dtype)
+    Ks = Ks.to(dtype=work_dtype)
+    Extrs = Extrs.to(dtype=work_dtype)
+
     nJoints = kp2ds.shape[-2]
 
     Pmat = Extrs[:, :3, :]  # (N, 3, 4)
@@ -212,8 +259,7 @@ def triangulate_dlt_torch(kp2ds, Ks, Extrs):
     A = A - Mmat[..., :2, :]  # (J, N, 2, 4)
     A = A.reshape(nJoints, -1, 4)  # (J, 2xN, 4)
 
-    U, D, VT = torch.linalg.svd(A)  # VT: (J, 4, 4)
-    X = VT[:, -1, :3] / VT[:, -1, 3:]  # (J, 3) # normalize
+    X = _solve_dlt_inhomogeneous(A)
     return X
 
 

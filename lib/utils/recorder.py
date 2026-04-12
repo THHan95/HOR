@@ -66,7 +66,8 @@ class Recorder:
 
     @master_only
     def record_checkpoints(self: T, model, optimizer: Union[Dict[str, Optimizer], Optimizer],
-                           scheduler: Union[Dict[str, _LRScheduler], _LRScheduler], epoch: int, snapshot: int):
+                           scheduler: Union[Dict[str, _LRScheduler], _LRScheduler], epoch: int, snapshot: int,
+                           scaler=None):
 
         assert self.rank == 0, "only master process can record loss"
         checkpoints_path = os.path.join(self.dump_path, "checkpoints")
@@ -92,6 +93,7 @@ class Recorder:
                 "scheduler": (scheduler.state_dict() if type(scheduler) is not dict else {
                     k: v.state_dict() for k, v in scheduler.items()
                 }),
+                "scaler": (scaler.state_dict() if scaler is not None and hasattr(scaler, "state_dict") else None),
                 "random_state": random_state,
             },
             is_best=False,
@@ -105,7 +107,8 @@ class Recorder:
                            optimizer: Union[Dict[str, Optimizer], Optimizer],
                            scheduler: Union[Dict[str, _LRScheduler], _LRScheduler],
                            resume_path: str,
-                           resume_epoch: Optional[int] = None):
+                           resume_epoch: Optional[int] = None,
+                           scaler=None):
         """resume checkpoints from resume_path, all process are synchronized
 
         Args:
@@ -125,7 +128,8 @@ class Recorder:
         epoch = load_train_param(optimizer,
                                  scheduler,
                                  os.path.join(resume_path, "train_param.pth.tar"),
-                                 map_location=map_location)
+                                 map_location=map_location,
+                                 scaler=scaler)
 
         load_random_state(os.path.join(resume_path, "random_state.pkl"))
         load_model(model, resume_path, map_location=map_location)

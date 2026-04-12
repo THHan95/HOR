@@ -7,8 +7,6 @@ import torch
 import torch.nn.functional as F
 import torchgeometry as tgm
 from manotorch.manolayer import ManoLayer
-
-
 def orthgonalProj(xy, scale, transl, img_size=256):
     scale = scale * img_size
     transl = transl * img_size / 2 + img_size / 2
@@ -32,38 +30,63 @@ class ManoDecoder(nn.Module):
         self.root_joint_idx = root_idx
         self.bbox_3d_size = bbox_3d
         self.input_img_shape = input_img_shape
+        self.pose6d_abs_max = 100.0
+        self.pose_euler_abs_max = float(4.0 * np.pi)
+        self.shape_abs_max = 10.0
+        self.cam_scale_min = 1e-4
+        self.cam_scale_max = 10.0
+        self.cam_trans_abs_max = 10.0
+        self.coord_abs_max = float(self.bbox_3d_size * 4.0)
+        self.coord_uv_abs_max = float(max(self.input_img_shape) * 8.0)
+
+    @staticmethod
+    def _sanitize_tensor(x, abs_max, nan_value=0.0):
+        return torch.nan_to_num(x, nan=nan_value, posinf=abs_max, neginf=-abs_max).clamp(-abs_max, abs_max)
+
+    def _sanitize_inputs(self, pose, shape, cam):
+        pose = self._sanitize_tensor(pose, self.pose6d_abs_max)
+        shape = self._sanitize_tensor(shape, self.shape_abs_max)
+        cam_scale = torch.nan_to_num(cam[:, 0:1], nan=1.0, posinf=self.cam_scale_max, neginf=self.cam_scale_min)
+        cam_scale = cam_scale.clamp(min=self.cam_scale_min, max=self.cam_scale_max)
+        cam_trans = self._sanitize_tensor(cam[:, 1:], self.cam_trans_abs_max)
+        cam = torch.cat((cam_scale, cam_trans), dim=1)
+        return pose, shape, cam
 
     def rot6d_to_rotmat(self, x):
         x = x.reshape(-1, 3, 2)
         a1 = x[:, :, 0]
         a2 = x[:, :, 1]
-        b1 = F.normalize(a1)
-        b2 = F.normalize(a2 - torch.einsum('bi,bi->b', b1, a2).unsqueeze(-1) * b1)
+        b1 = F.normalize(a1, dim=-1, eps=1e-6)
+        b2 = F.normalize(a2 - torch.einsum('bi,bi->b', b1, a2).unsqueeze(-1) * b1, dim=-1, eps=1e-6)
         b3 = torch.cross(b1, b2, dim=-1)
         return torch.stack((b1, b2, b3), dim=-1)
 
     def forward(self, pose, shape, cam):
+        pose = pose.float()
+        shape = shape.float()
+        cam = cam.float()
+        pose, shape, cam = self._sanitize_inputs(pose, shape, cam)
+
         batch = pose.shape[0]
-        # transform rot-6d to angle-axis
         pose = self.rot6d_to_rotmat(pose)
-        # pose = kornia.geometry.conversions.rotation_matrix_to_angle_axis(pose).reshape(batch, -1)
-        pose = torch.cat([pose, torch.zeros((pose.shape[0], 3, 1)).to(pose.device).float()], 2)
+        pose = torch.nan_to_num(pose, nan=0.0, posinf=1.0, neginf=-1.0)
+        pose = torch.cat([pose, torch.zeros((pose.shape[0], 3, 1), device=pose.device, dtype=pose.dtype)], 2)
         pose_euler = tgm.rotation_matrix_to_angle_axis(pose).reshape(batch, -1)
-        # get coordinates from MANO layer
+        pose_euler = self._sanitize_tensor(pose_euler, self.pose_euler_abs_max)
+
         self.mano_layer = self.mano_layer.to(pose_euler.device)
         mano_out = self.mano_layer(pose_euler, shape)
-        mano_vert_cam = mano_out.verts
-        mano_joint_cam = mano_out.joints
+        mano_vert_cam = self._sanitize_tensor(mano_out.verts, self.coord_abs_max)
+        mano_joint_cam = self._sanitize_tensor(mano_out.joints, self.coord_abs_max)
         coord_xyz = torch.cat((mano_vert_cam, mano_joint_cam), dim=1)
-        # root-relative
         coord_xyz = coord_xyz - mano_joint_cam[:, self.root_joint_idx, None]
-        # project xy to uv
+        coord_xyz = self._sanitize_tensor(coord_xyz, self.coord_abs_max)
+
         coord_uv = orthgonalProj(coord_xyz[:, :, :2].clone(), cam[:, 0:1].unsqueeze(1), cam[:, 1:].unsqueeze(1))
-        # normalization
+        coord_uv = self._sanitize_tensor(coord_uv, self.coord_uv_abs_max)
+
         coord_xyz = coord_xyz / (self.bbox_3d_size / 2)
         coord_uv = coord_uv / (self.input_img_shape[0] // 2) - 1
-        # coord_uv = coord_uv / self.input_img_shape[0]
-        # coord_uvd = torch.cat((coord_uv, coord_xyz[:, :, 2:3]), dim=2)
         return coord_xyz, coord_uv, pose_euler, shape, cam
     
 
@@ -79,7 +102,7 @@ class Linear(nn.Module):
         y = x.matmul(self.linear.weight.t())
 
         if self.norm:
-            x_norm = torch.norm(x, dim=1, keepdim=True)
+            x_norm = torch.norm(x, dim=1, keepdim=True).clamp_min(1e-6)
             y = y / x_norm
 
         if self.bias:
@@ -317,14 +340,18 @@ class Proj2World(nn.Module):
         hand_coord_pred = (hand_coord_pred + 1) / 2  # Normalize to [0, 1]
         hand_coord_im = torch.einsum("bij, j->bij", hand_coord_pred, torch.tensor([W, H]).to(hand_coord_pred.device))  # range 0~W,H
         hand_coord_im = hand_coord_im.view(batch_size, num_cams, self.num_hand_joints, 2)  # (B, N, 21, 2)
-        hand_confidence_im = hand_confidence.view(batch_size, num_cams, self.num_hand_joints)  # (B, N, 21)
+        hand_confidence_im = hand_confidence.view(batch_size, num_cams, self.num_hand_joints, -1)
+        if hand_confidence_im.shape[-1] == 1:
+            hand_confidence_im = hand_confidence_im.squeeze(-1)
 
         ref_hand = batch_triangulate_dlt_torch_confidence(hand_coord_im, K, T_c2m, hand_confidence_im)  # (B, 21, 3)
 
         obj_coord_pred = (obj_coord_pred + 1) / 2  # Normalize to [0, 1]
         obj_coord_im = torch.einsum("bij, j->bij", obj_coord_pred, torch.tensor([W, H]).to(obj_coord_pred.device))  # range 0~W,H
         obj_coord_im = obj_coord_im.view(batch_size, num_cams, self.num_obj_joints, 2)  # (B, N, 1, 2)
-        obj_confidence_im = obj_confidence.view(batch_size, num_cams, self.num_obj_joints)  # (B, N, 1)
+        obj_confidence_im = obj_confidence.view(batch_size, num_cams, self.num_obj_joints, -1)
+        if obj_confidence_im.shape[-1] == 1:
+            obj_confidence_im = obj_confidence_im.squeeze(-1)
 
         ref_obj = batch_triangulate_dlt_torch_confidence(obj_coord_im, K, T_c2m, obj_confidence_im)  # (B, 1, 3)
 

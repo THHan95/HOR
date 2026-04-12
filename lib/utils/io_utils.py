@@ -77,6 +77,7 @@ def load_train_param(
     scheduler: Union[Dict[str, _LRScheduler], _LRScheduler],
     resume_path: str,
     map_location=None,
+    scaler=None,
 ):
     try:
         parameters = torch.load(resume_path, map_location=map_location)
@@ -106,6 +107,10 @@ def load_train_param(
                 if len(scheduler_missing_states) > 0:
                     logger.warning(f"Missing keys in scheduler ! : {scheduler_missing_states}")
                 scheduler[key].load_state_dict(parameters["scheduler"][key])
+        if scaler is not None and hasattr(scaler, "load_state_dict"):
+            scaler_state = parameters.get("scaler", None)
+            if scaler_state:
+                scaler.load_state_dict(scaler_state)
         return epoch
     except:
         traceback.print_exc()

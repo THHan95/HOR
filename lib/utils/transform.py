@@ -94,23 +94,91 @@ class SimpleTransform2D:
         self._stage12_occlusion_prob = cfg.get("STAGE12_OCCLUSION_PROB", 0.0)
         self._min_joints_after_crop = int(cfg.get("MIN_JOINTS_AFTER_CROP", 3))
         self._min_joints_in_raw = int(cfg.get("MIN_JOINTS_IN_RAW", 3))
-        self.current_stage_name = "stage3"
+        self.current_stage_name = "stage2"
 
         self._with_heatmap = cfg.DATA_PRESET.get("WITH_HEATMAP", False)
         self._with_mask = cfg.DATA_PRESET.get("WITH_MASK", False)
         self._heatmap_size = cfg.DATA_PRESET.get("HEATMAP_SIZE", (64, 64))
         self._heatmap_sigma = cfg.DATA_PRESET.get("HEATMAP_SIGMA", 2.0)
+        self._with_obj_occ = cfg.DATA_PRESET.get("WITH_OBJ_OCC", self._with_heatmap)
+        self._obj_occ_size = cfg.DATA_PRESET.get("OBJ_OCC_SIZE", self._heatmap_size)
+        self._obj_occ_radius = int(cfg.DATA_PRESET.get("OBJ_OCC_RADIUS", 1))
+        self._obj_occ_blur_sigma = float(cfg.DATA_PRESET.get("OBJ_OCC_BLUR_SIGMA", 1.0))
         self._mask_scale_to_heatmap = cfg.DATA_PRESET.get("MASK_SCALE_TO_HEATMAP", False)
 
         if self._occlusion:
             self.occlusion_op = RandomOcclusion(self._occlusion_prob)
+
+    def _generate_target_heatmap(self, coords_2d, visibility=None):
+        coords_2d = np.asarray(coords_2d, dtype=np.float32)
+        num_points = coords_2d.shape[0]
+        target_heatmap = np.zeros((num_points, self._heatmap_size[1], self._heatmap_size[0]), dtype=np.float32)
+        imsize = np.array(self._output_size, dtype=np.float32)
+        hmsize = np.array(self._heatmap_size, dtype=np.float32)
+
+        for i in range(num_points):
+            if visibility is not None and visibility[i] <= 0:
+                continue
+            coord_hm = ((coords_2d[i] / imsize) * hmsize).astype(np.int32)
+            target_heatmap[i], _ = generate_heatmap(target_heatmap[i], coord_hm, self._heatmap_sigma)
+
+        return target_heatmap
+
+    def _generate_point_occupancy_map(self, coords_2d, depth=None):
+        occ_h, occ_w = self._obj_occ_size[1], self._obj_occ_size[0]
+        occupancy = np.zeros((occ_h, occ_w), dtype=np.float32)
+        if coords_2d is None:
+            return occupancy
+
+        coords_2d = np.asarray(coords_2d, dtype=np.float32)
+        if coords_2d.size == 0:
+            return occupancy
+
+        if depth is not None:
+            depth = np.asarray(depth, dtype=np.float32).reshape(-1)
+            valid = depth > 1e-6
+            coords_2d = coords_2d[valid]
+        if coords_2d.size == 0:
+            return occupancy
+
+        imsize = np.array(self._output_size, dtype=np.float32)
+        occsize = np.array(self._obj_occ_size, dtype=np.float32)
+        coords_occ = (coords_2d / imsize) * occsize
+        inside = (
+            (coords_occ[:, 0] >= 0.0)
+            & (coords_occ[:, 0] < occ_w)
+            & (coords_occ[:, 1] >= 0.0)
+            & (coords_occ[:, 1] < occ_h)
+        )
+        coords_occ = coords_occ[inside]
+        if coords_occ.size == 0:
+            return occupancy
+
+        radius = max(1, self._obj_occ_radius)
+        for x_f, y_f in coords_occ:
+            x_i = int(np.clip(round(float(x_f)), 0, occ_w - 1))
+            y_i = int(np.clip(round(float(y_f)), 0, occ_h - 1))
+            cv2.circle(occupancy, (x_i, y_i), radius=radius, color=1.0, thickness=-1)
+
+        if self._obj_occ_blur_sigma > 0:
+            occupancy = cv2.GaussianBlur(
+                occupancy,
+                ksize=(0, 0),
+                sigmaX=self._obj_occ_blur_sigma,
+                sigmaY=self._obj_occ_blur_sigma,
+            )
+
+        max_value = float(occupancy.max())
+        if max_value > 0:
+            occupancy /= max_value
+        return occupancy.astype(np.float32)
 
     def set_stage(self, stage_name: str):
         self.current_stage_name = stage_name
         if not self._aug:
             return
 
-        if stage_name in ["stage1", "stage2"]:
+        if stage_name == "stage1":
             self._scale_jit_factor = self._stage12_scale_jit_factor
             self._rot_jit_factor = self._stage12_rot_jit_factor
             self._rot_prob = self._stage12_rot_prob
@@ -204,19 +272,7 @@ class SimpleTransform2D:
             results["mask"] = mask
 
         if self._with_heatmap:
-            j2d = target_joints_2d  # (21, 2)
-            nJ = j2d.shape[0]  # number of joints
-            """ Generate GT Gussian heatmap for joints_2d"""
-            target_j_heatmap = np.zeros((nJ, self._heatmap_size[1], self._heatmap_size[0]),
-                                        dtype="float32")  # (nJ, H, W)
-
-            imsize = np.array(self._output_size)  # shape (2)
-            hmsize = np.array(self._heatmap_size)  # shape (2)
-            for i in range(nJ):
-                j2d_i = ((j2d[i] / imsize) * hmsize).astype(np.int32)
-                target_j_heatmap[i], _ = generate_heatmap(target_j_heatmap[i], j2d_i, self._heatmap_sigma)
-
-            results["target_joints_heatmap"] = target_j_heatmap
+            results["target_joints_heatmap"] = self._generate_target_heatmap(target_joints_2d, target_joints_vis)
             if self._mask_scale_to_heatmap:
                 mask = cv2.resize(results["mask"], self._heatmap_size, interpolation=cv2.INTER_LINEAR)
                 results["mask"] = mask
@@ -304,8 +360,22 @@ class SimpleTransform3DMultiView(SimpleTransformUVD):
         
         if label.get("obj_pc_sparse") is not None:
             # 旋转绝对点云 (相机系)
-            results["target_obj_pc_sparse"] = rot_mat.dot(label["obj_pc_sparse"].transpose(1, 0)).transpose()
-            results["target_obj_pc_dense"] = rot_mat.dot(label["obj_pc_dense"].transpose(1, 0)).transpose()
+            target_obj_pc_sparse = rot_mat.dot(label["obj_pc_sparse"].transpose(1, 0)).transpose()
+            target_obj_pc_dense = rot_mat.dot(label["obj_pc_dense"].transpose(1, 0)).transpose()
+            results["target_obj_pc_sparse"] = target_obj_pc_sparse
+            results["target_obj_pc_dense"] = target_obj_pc_dense
+            if self._with_obj_occ:
+                obj_sparse_2d_h = target_cam_intr.dot(target_obj_pc_sparse.T).T
+                obj_sparse_z = obj_sparse_2d_h[:, 2:3]
+                obj_sparse_z[np.abs(obj_sparse_z) < 1e-6] = 1e-6
+                obj_sparse_uv = np.concatenate(
+                    [obj_sparse_2d_h[:, 0:1] / obj_sparse_z, obj_sparse_2d_h[:, 1:2] / obj_sparse_z],
+                    axis=-1,
+                ).astype(np.float32)
+                results["target_obj_occupancy"] = self._generate_point_occupancy_map(
+                    obj_sparse_uv,
+                    depth=target_obj_pc_sparse[:, 2],
+                )[None, ...]
 
         # 🌟 核心：处理 6D Pose 标签的数据增强旋转
         if label.get("R_label") is not None:
@@ -355,6 +425,8 @@ class SimpleTransform3DMultiView(SimpleTransformUVD):
             results["target_obj_center_3d"] = target_obj_center_3d
             results["target_obj_center_uv"] = target_obj_center_uv
             results["target_obj_center_vis"] = target_obj_center_vis
+            if self._with_heatmap:
+                results["target_obj_center_heatmap"] = self._generate_target_heatmap(obj_uv, target_obj_center_vis)
 
         # 🌟 同步旋转 4x4 物体位姿矩阵
         if label.get("obj_transform") is not None:
@@ -1030,10 +1102,13 @@ def batch_cam_intr_projection(batch_cam_intr, batch_joints, eps=1e-7):
         torch.Tensor: shape (BATCH, NPERSP, NJOINTS, 2)
     """
     res = (batch_cam_intr @ batch_joints.transpose(2, 3)).transpose(2, 3)  # [B, NPERSP, 21, 3]
+    res = torch.nan_to_num(res, nan=0.0, posinf=1e6, neginf=-1e6)
     xy = res[..., 0:2]
     z = res[..., 2:]
-    z[torch.abs(z) < eps] = eps
-    uv = xy / z
+    z_sign = torch.where(z >= 0.0, torch.ones_like(z), -torch.ones_like(z))
+    safe_z = torch.where(torch.abs(z) < eps, z_sign * eps, z)
+    uv = xy / safe_z
+    uv = torch.nan_to_num(uv, nan=0.0, posinf=1e6, neginf=-1e6)
     return uv
 
 

@@ -45,9 +45,16 @@ class HDataset(torch.utils.data.Dataset, ABC):
         self.center_idx = int(cfg.DATA_PRESET.CENTER_IDX)
         self.sides = CONST.SIDE
         self.njoints = CONST.NUM_JOINTS
-        self.current_stage_name = "stage3"
+        self.current_stage_name = "stage2"
         self.stage12_bbox_expand_ratio = float(cfg.DATA_PRESET.get("STAGE12_BBOX_EXPAND_RATIO", 1.5))
-        self.stage3_hand_obj_scale = float(cfg.DATA_PRESET.get("STAGE3_HAND_OBJ_SCALE", 1.25))
+        self.stage12_use_hand_obj_bbox = bool(cfg.DATA_PRESET.get("STAGE12_USE_HAND_OBJ_BBOX", False))
+        # Keep the old bbox key as a fallback so existing data presets do not break.
+        self.stage2_hand_obj_scale = float(
+            cfg.DATA_PRESET.get("STAGE2_HAND_OBJ_SCALE", cfg.DATA_PRESET.get("STAGE3_HAND_OBJ_SCALE", 1.25))
+        )
+        self.stage12_hand_obj_scale = float(
+            cfg.DATA_PRESET.get("STAGE12_HAND_OBJ_SCALE", self.stage2_hand_obj_scale)
+        )
 
         self.transform = build_transform(cfg=cfg.TRANSFORM,
                                          data_preset=self.data_preset,
@@ -161,10 +168,14 @@ class HDataset(torch.utils.data.Dataset, ABC):
 
     def _get_3d_bbox(self, idx):
         if self.current_stage_name in ["stage1", "stage2"]:
+            if self.stage12_use_hand_obj_bbox:
+                bbox_center, bbox_scale = self.get_bbox_hand_obj(idx, scale_factor=self.stage12_hand_obj_scale)
+                if bbox_center is not None and bbox_scale is not None:
+                    return bbox_center, bbox_scale
             bbox_center, bbox_scale = self.get_bbox_center_scale(idx)
             bbox_scale = bbox_scale * self.stage12_bbox_expand_ratio
             return bbox_center, bbox_scale
-        return self.get_bbox_hand_obj(idx, scale_factor=self.stage3_hand_obj_scale)
+        return self.get_bbox_hand_obj(idx, scale_factor=self.stage2_hand_obj_scale)
 
     # visible in raw image
     def get_joints_2d_vis(self, joints_2d=None, raw_size=None, **kwargs):

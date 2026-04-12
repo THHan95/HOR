@@ -5,8 +5,9 @@ from .heads.ptEmb_head import POEM_PositionEmbeddedAggregationHead, POEM_Project
 from .heads.ptHOR_head import HOR_Projective_SelfAggregation_Head
 
 from .layers.petr_transformer import PETRTransformer
-from .layers.ptEmb_transformer import HORTR
+from .layers.ptEmb_transformer import HORTR, HORTR_HO, HORTR_Hand
 from .PETR import PETRMultiView
 from .MVP import MVP
 from .POEM import PtEmbedMultiviewStereo
 from .HOR import POEM_RLE
+from .HOR_heatmap import POEM_Heatmap

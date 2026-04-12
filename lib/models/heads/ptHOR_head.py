@@ -13,15 +13,13 @@ from ...utils.transform import (inverse_sigmoid, batch_cam_extr_transf, batch_ca
                                 denormalize, rot6d_to_rotmat, rotmat_to_rot6d)
 from ..bricks.transformer import build_transformer
 from ..bricks.utils import ManoDecoder
-from ..layers.ptEmb_transformer import HORStage2Context, HORStage3Context
+from ..layers.ptEmb_transformer import HORHandObjectContext, HORHandRefineContext
 from ..layers.petr_transformer import SinePositionalEncoding3D
 
 import imageio
 import warnings
 import cv2
 import time
-
-
 def _no_grad_trunc_normal_(tensor, mean, std, a, b):
     # Cut & paste from PyTorch official master until it's in a few official releases - RW
     # Method based on https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
@@ -257,14 +255,37 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             "TRANSFORMER_CENTER_IDX",
             self.data_preset_cfg.CENTER_IDX,
         )
-        self.stage3_hand_update_min_scale = float(cfg.get("STAGE3_HAND_UPDATE_MIN_SCALE", 0.2))
-        self.stage3_obj_feat_min_scale = float(cfg.get("STAGE3_OBJ_FEAT_MIN_SCALE", 0.2))
-        self.stage3_pose_delta_min_scale = float(cfg.get("STAGE3_POSE_DELTA_MIN_SCALE", 0.1))
-        self.stage3_init_rot_min_scale = float(cfg.get("STAGE3_INIT_ROT_MIN_SCALE", 0.1))
+        # Legacy STAGE3_* keys remain as config fallbacks for older checkpoints/YAMLs.
+        self.stage2_hand_update_min_scale = float(
+            cfg.get("STAGE2_HAND_UPDATE_MIN_SCALE", cfg.get("STAGE3_HAND_UPDATE_MIN_SCALE", 0.2))
+        )
+        self.stage2_obj_feat_min_scale = float(
+            cfg.get("STAGE2_OBJ_FEAT_MIN_SCALE", cfg.get("STAGE3_OBJ_FEAT_MIN_SCALE", 0.2))
+        )
+        self.stage2_pose_delta_min_scale = float(
+            cfg.get("STAGE2_POSE_DELTA_MIN_SCALE", cfg.get("STAGE3_POSE_DELTA_MIN_SCALE", 0.1))
+        )
+        self.stage2_init_rot_min_scale = float(
+            cfg.get("STAGE2_INIT_ROT_MIN_SCALE", cfg.get("STAGE3_INIT_ROT_MIN_SCALE", 0.1))
+        )
+        self.obj_init_rot_delta_abs_max = float(cfg.get("OBJ_INIT_ROT_DELTA_ABS_MAX", 0.5))
+        self.obj_pose_rot_delta_abs_max = float(cfg.get("OBJ_POSE_ROT_DELTA_ABS_MAX", 0.2))
+        self.obj_pose_trans_delta_abs_max = float(cfg.get("OBJ_POSE_TRANS_DELTA_ABS_MAX", 0.1))
         super(HOR_Projective_SelfAggregation_Head, self).__init__(cfg)
 
     def _build_head_module(self):
         super(HOR_Projective_SelfAggregation_Head, self)._build_head_module()
+        hand_transformer_cfg = self.cfg_transformer.clone()
+        hand_transformer_cfg.defrost()
+        hand_transformer_cfg.TYPE = "HORTR_Hand"
+        hand_transformer_cfg.freeze()
+        self.hand_transformer = build_transformer(hand_transformer_cfg)
+        del self.transformer
+        ho_transformer_cfg = self.cfg_transformer.clone()
+        ho_transformer_cfg.defrost()
+        ho_transformer_cfg.TYPE = "HORTR_HO"
+        ho_transformer_cfg.freeze()
+        self.ho_transformer = build_transformer(ho_transformer_cfg)
 
         self.merge_net_feature = nn.ModuleList()
         self.merge_net_feature.append(
@@ -273,13 +294,6 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         self.merge_net_feature.append(
             nn.Sequential(nn.Linear(self.embed_dims // 2, self.embed_dims // 2), nn.ReLU(),
                           nn.Linear(self.embed_dims // 2, self.embed_dims)))
-        self.obj_init_rot_regressor = nn.Sequential(
-            nn.Linear(self.embed_dims * 2, self.embed_dims),
-            nn.ReLU(),
-            nn.Linear(self.embed_dims, self.embed_dims // 2),
-            nn.ReLU(),
-            nn.Linear(self.embed_dims // 2, 6),
-        )
         self.obj_pose_delta_regressor = nn.Sequential(
             nn.Linear(self.pt_feat_dim + self.embed_dims * 2 + 9, self.pt_feat_dim),
             nn.ReLU(),
@@ -309,15 +323,14 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             nn.ReLU(),
             nn.Linear(self.pt_feat_dim // 2, 109),
         )
-        self.final_mesh_mano_regressor = nn.Sequential(
-            nn.Linear(self.pt_feat_dim + 3, self.pt_feat_dim),
-            nn.ReLU(),
-            nn.Linear(self.pt_feat_dim, self.pt_feat_dim // 2),
-            nn.ReLU(),
-            nn.Linear(self.pt_feat_dim // 2, 109),
-        )
         self.register_buffer("identity_rot6d", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=torch.float32))
         self.mano_scale = float(self.data_preset_cfg.BBOX_3D_SIZE) / 2.0
+        self.mano_feat_abs_max = 1e4
+        self.mano_param_abs_max = 100.0
+        self.obj_feat_abs_max = 1e4
+        self.obj_rot6d_abs_max = 10.0
+        self.obj_trans_norm_abs_max = 10.0
+        self.obj_xyz_norm_abs_max = 20.0
         self.mano_decoder = ManoDecoder(
             self.transformer_center_idx,
             self.data_preset_cfg.BBOX_3D_SIZE,
@@ -329,24 +342,60 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         str_ = super()._str_custom_args()
         return str_ + ", " + f"agg_merge_mode: {self.merge_mode}"
 
-    def merge_features_mv(self, q, merge_net, master_id):
+    @staticmethod
+    def _normalize_view_weights(view_weights, num_cams, dtype):
+        if view_weights is None:
+            return None
+        view_weights = view_weights.to(dtype=dtype)
+        return view_weights / (view_weights.sum(dim=-1, keepdim=True) + 1e-6) * float(num_cams)
+
+    @staticmethod
+    def _project_matrix_to_rotation(matrix):
+        orig_dtype = matrix.dtype
+        compute_dtype = torch.float32 if matrix.dtype in (torch.float16, torch.bfloat16) else matrix.dtype
+        matrix_f = matrix.to(dtype=compute_dtype)
+        # Avoid SVD here. Its backward is numerically unstable around repeated singular values
+        # and it is the source of stage2 non-finite gradients. Reproject through the 6D
+        # rotation representation instead: take the first two columns and apply Gram-Schmidt.
+        projected = rot6d_to_rotmat(matrix_f[..., :3, :2].reshape(*matrix_f.shape[:-2], 6))
+        return projected.to(dtype=orig_dtype)
+
+    def merge_features_mv(self, q, merge_net, master_id, view_weights=None):
         """
             q: [B, nsample, N, 256]
             q_merged: [B, nsample, 256]
         """
-        master_is_zero = torch.sum(master_id)
-        assert master_is_zero == 0, "only support master_id is 0"
+        if torch.any(master_id != 0):
+            raise ValueError("merge_features_mv currently only supports master_id == 0")
         cam_num = q.shape[2]
+        if cam_num == 1:
+            return q[:, :, 0, :]
 
         q1 = q[:, :, 0, :]
         q = merge_net[0](q)
         master_features = q[:, :, 0, :]  # [B, nsample, 128]
         other_features = q[:, :, 1:, :]  # [B, nsample, 7, 128]
-        q = torch.matmul(other_features, master_features.unsqueeze(-1))  # [B, nsample, 7, 1]
-        q = torch.matmul(other_features.transpose(2, 3), q).squeeze(-1)
+        if view_weights is not None:
+            view_weights = self._normalize_view_weights(view_weights, cam_num, q.dtype)
+            master_weight = view_weights[:, :, 0:1]
+            other_weight = view_weights[:, :, 1:]
+            master_features = master_features * master_weight
+            score = torch.matmul(other_features, master_features.unsqueeze(-1)).squeeze(-1)
+            score = score + torch.log(other_weight.clamp(min=1e-6))
+            attn = torch.softmax(score, dim=2)
+            q = torch.sum(other_features * attn.unsqueeze(-1), dim=2)
+        else:
+            q = torch.matmul(other_features, master_features.unsqueeze(-1))  # [B, nsample, 7, 1]
+            q = torch.matmul(other_features.transpose(2, 3), q).squeeze(-1)
         q_merged = merge_net[1](q) / cam_num  # [B, nsample, 256]
         q_merged = q1 + q_merged
         return q_merged
+
+    def sample_query_features_per_view(self, feat_map, query_2d, batch_size, num_cams, num_points):
+        feat_dim = feat_map.size(2)
+        sampled_feats = F.grid_sample(feat_map.flatten(0, 1), query_2d, align_corners=False)
+        sampled_feats = sampled_feats.squeeze(-1).reshape(batch_size, num_cams, feat_dim, num_points).permute(0, 1, 2, 3)
+        return sampled_feats.permute(0, 1, 3, 2).contiguous()
 
     def _debug_viz(self, debug_metas, src_points_sub, idx=0):
         # Visualize the first view
@@ -368,9 +417,17 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         obj_xyz_master = (obj_xyz_norm * self.mano_scale) + hand_center_point
         return obj_xyz_norm, obj_xyz_master, obj_trans_master, obj_trans_norm
 
+    def _sanitize_mano_tensor(self, tensor, abs_max, nan_value=0.0):
+        return torch.nan_to_num(tensor, nan=nan_value, posinf=abs_max, neginf=-abs_max).clamp(-abs_max, abs_max)
+
+    def _sanitize_obj_tensor(self, tensor, abs_max, nan_value=0.0):
+        return torch.nan_to_num(tensor, nan=nan_value, posinf=abs_max, neginf=-abs_max).clamp(-abs_max, abs_max)
+
     def predict_mano_from_tokens(self, token_feats, token_xyz, regressor):
-        pooled_feat = torch.cat((token_feats, token_xyz), dim=-1).mean(dim=1)
+        pooled_feat = torch.cat((token_feats, token_xyz), dim=-1).mean(dim=1).float()
+        pooled_feat = self._sanitize_mano_tensor(pooled_feat, self.mano_feat_abs_max)
         mano_params = regressor(pooled_feat)
+        mano_params = self._sanitize_mano_tensor(mano_params.float(), self.mano_param_abs_max)
         pred_hand_pose = mano_params[:, :96]
         pred_shape = mano_params[:, 96:106]
         pred_cam = mano_params[:, 106:]
@@ -384,17 +441,125 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         }
         return coord_xyz, pred_mano_params
 
-    def sample_hand_mesh_features_from_master(self, feat_map, hand_mesh_xyz_master, img_metas, inp_res, batch_size, num_cams):
+    def _interpolate_point_view_weights(self, query_xyz, anchor_xyz, anchor_view_weights, k=4):
+        if anchor_view_weights is None:
+            return None
+        num_anchor = anchor_xyz.shape[1]
+        if anchor_view_weights.dim() != 3:
+            raise ValueError(
+                f"anchor_view_weights should have shape [B, num_anchor, num_views], got {tuple(anchor_view_weights.shape)}"
+            )
+        if anchor_view_weights.shape[1] != num_anchor:
+            raise ValueError(
+                f"anchor_view_weights anchor dim mismatch: expected {num_anchor}, got {anchor_view_weights.shape[1]}"
+            )
+        k = min(k, num_anchor)
+        dists = torch.cdist(query_xyz, anchor_xyz)
+        knn_dists, knn_idx = torch.topk(dists, k=k, dim=-1, largest=False)
+        inv_dists = 1.0 / (knn_dists + 1e-6)
+        interp_weights = inv_dists / (inv_dists.sum(dim=-1, keepdim=True) + 1e-6)
+        gather_idx = knn_idx.unsqueeze(-1).expand(-1, -1, -1, anchor_view_weights.shape[-1])
+        gathered = torch.gather(
+            anchor_view_weights.unsqueeze(1).expand(-1, query_xyz.shape[1], -1, -1),
+            2,
+            gather_idx,
+        )
+        return torch.sum(gathered * interp_weights.unsqueeze(-1), dim=2)
+
+    def sample_hand_mesh_features_from_master(
+        self,
+        feat_map,
+        hand_mesh_xyz_master,
+        img_metas,
+        inp_res,
+        batch_size,
+        num_cams,
+        reference_hand=None,
+        joint_view_weights=None,
+    ):
         hand_mesh_2d = self.project_points_to_views(hand_mesh_xyz_master, img_metas, inp_res)
+        mesh_view_weights = self._interpolate_point_view_weights(hand_mesh_xyz_master, reference_hand, joint_view_weights)
         return self.sample_multiview_features(
             feat_map,
             hand_mesh_2d,
             batch_size,
             num_cams,
             hand_mesh_xyz_master.shape[1],
+            view_weights=mesh_view_weights,
         )
 
+    def build_object_point_view_weights(
+        self,
+        obj_xyz_master,
+        obj_center_master,
+        img_metas,
+        inp_res,
+        obj_view_conf,
+        obj_view_conf_xy,
+        obj_occ_map=None,
+    ):
+        if obj_view_conf is None and obj_view_conf_xy is None and obj_occ_map is None:
+            return None
+
+        num_cams = img_metas["cam_intr"].shape[1]
+        obj_points_mv = obj_xyz_master.unsqueeze(1).repeat(1, num_cams, 1, 1)
+        obj_center_mv = obj_center_master.unsqueeze(1).repeat(1, num_cams, 1, 1)
+        cam_extr_inv = torch.linalg.inv(img_metas["cam_extr"])
+
+        obj_points_cam = batch_cam_extr_transf(cam_extr_inv, obj_points_mv)
+        obj_center_cam = batch_cam_extr_transf(cam_extr_inv, obj_center_mv)
+        obj_points_2d = batch_cam_intr_projection(img_metas["cam_intr"], obj_points_cam)
+        obj_center_2d = batch_cam_intr_projection(img_metas["cam_intr"], obj_center_cam)
+
+        if obj_view_conf_xy is not None:
+            sigma_xy = 1.0 / obj_view_conf_xy.clamp(min=1e-6)
+        elif obj_view_conf is not None:
+            sigma_scalar = 1.0 / obj_view_conf.clamp(min=1e-6)
+            sigma_xy = sigma_scalar.unsqueeze(-1).expand(-1, -1, 2)
+        else:
+            sigma_xy = obj_points_2d.new_ones(obj_points_2d.shape[0], obj_points_2d.shape[1], 2)
+
+        point_offsets = torch.abs(obj_points_2d - obj_center_2d)
+        object_extent = point_offsets.amax(dim=2, keepdim=True).clamp(min=4.0)
+        support_xy = sigma_xy.unsqueeze(2) + object_extent
+        radial_weight = torch.exp(-0.5 * (((obj_points_2d - obj_center_2d) / support_xy.clamp(min=1e-6)) ** 2).sum(dim=-1))
+
+        img_w, img_h = float(inp_res[0].item()), float(inp_res[1].item())
+        in_front = (obj_points_cam[..., 2] > 1e-6).float()
+        in_frame = (
+            (obj_points_2d[..., 0] >= 0.0)
+            & (obj_points_2d[..., 0] < img_w)
+            & (obj_points_2d[..., 1] >= 0.0)
+            & (obj_points_2d[..., 1] < img_h)
+        ).float()
+        visibility = in_front * in_frame
+
+        if obj_view_conf_xy is not None:
+            base_view_weight = torch.sqrt(torch.prod(obj_view_conf_xy.clamp(min=1e-6), dim=-1)).unsqueeze(-1)
+        elif obj_view_conf is not None:
+            base_view_weight = obj_view_conf.unsqueeze(-1)
+        else:
+            base_view_weight = radial_weight.new_ones(radial_weight.shape[0], radial_weight.shape[1], 1)
+
+        occ_scores = 1.0
+        if obj_occ_map is not None:
+            occ_query = obj_points_2d.unsqueeze(-2)
+            occ_query = occ_query * (1.0 / inp_res).to(device=occ_query.device, dtype=occ_query.dtype).view(1, 1, 1, 1, 2)
+            occ_query = occ_query * 2.0 - 1.0
+            occ_scores = F.grid_sample(
+                obj_occ_map.flatten(0, 1),
+                occ_query.flatten(0, 1),
+                align_corners=False,
+            )
+            occ_scores = occ_scores.squeeze(1).squeeze(-1).view(obj_points_2d.shape[0], num_cams, obj_points_2d.shape[2])
+            occ_scores = occ_scores.clamp(min=0.0, max=1.0)
+
+        point_view_weights = radial_weight * visibility * base_view_weight * occ_scores
+        return point_view_weights.permute(0, 2, 1).contiguous()
+
     def build_object_points_from_pose(self, obj_template, hand_center_point, rot6d, trans_norm):
+        rot6d = self._sanitize_obj_tensor(rot6d, self.obj_rot6d_abs_max)
+        trans_norm = self._sanitize_obj_tensor(trans_norm, self.obj_trans_norm_abs_max)
         if obj_template.dim() == 2:
             obj_template = obj_template.unsqueeze(0).expand(rot6d.shape[0], -1, -1)
         obj_template_norm = obj_template / self.mano_scale
@@ -408,41 +573,45 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             expand_shape = [1] * (rot6d.dim() - 1) + [obj_template_norm.shape[-2], 3]
             obj_template_expand = obj_template_norm.view(*expand_shape).expand(*rot6d.shape[:-1], obj_template_norm.shape[-2], 3)
         obj_xyz_norm = torch.matmul(obj_template_expand, rotmat.transpose(-1, -2)) + trans_norm.unsqueeze(-2)
+        obj_xyz_norm = self._sanitize_obj_tensor(obj_xyz_norm, self.obj_xyz_norm_abs_max)
         if hand_center_point.dim() == rot6d.dim():
             hand_center_expand = hand_center_point
         else:
             hand_center_expand = hand_center_point.view(*([1] * (rot6d.dim() - 2)), *hand_center_point.shape)
         obj_xyz_master = (obj_xyz_norm * self.mano_scale) + hand_center_expand
+        obj_xyz_master = self._sanitize_obj_tensor(obj_xyz_master, self.obj_xyz_norm_abs_max * self.mano_scale)
         obj_center_master = obj_xyz_master.mean(dim=-2, keepdim=True)
         obj_trans = trans_norm * self.mano_scale
         return obj_xyz_norm, obj_xyz_master, obj_center_master, obj_trans
 
-    def predict_initial_object_rotation(self, feat_map, obj_center_feat, warmup_scale=1.0):
-        global_mv_feat = feat_map.mean(dim=(1, 3, 4))
-        init_feat = torch.cat((global_mv_feat, obj_center_feat), dim=-1)
-        identity_rot = self.identity_rot6d.unsqueeze(0).expand(global_mv_feat.shape[0], -1)
-        raw_rot_delta = self.obj_init_rot_regressor(init_feat)
-        init_rot_seed = identity_rot + (warmup_scale * raw_rot_delta)
-        init_rotmat = rot6d_to_rotmat(init_rot_seed)
-        init_rot6d = rotmat_to_rot6d(init_rotmat)
-        return init_rot6d, global_mv_feat
-
     def update_object_pose(self, obj_feats, obj_center_feat, global_mv_feat, current_rot6d, current_trans_norm, warmup_scale=1.0):
-        global_obj_feat = obj_feats.mean(dim=1)
-        pose_input = torch.cat((global_obj_feat, obj_center_feat, global_mv_feat, current_rot6d, current_trans_norm), dim=-1)
-        delta_pose = self.obj_pose_delta_regressor(pose_input) * warmup_scale
-        next_rot_seed = current_rot6d + delta_pose[:, :6]
+        global_obj_feat = self._sanitize_obj_tensor(obj_feats.mean(dim=1), self.obj_feat_abs_max)
+        obj_center_feat = self._sanitize_obj_tensor(obj_center_feat, self.obj_feat_abs_max)
+        global_mv_feat = self._sanitize_obj_tensor(global_mv_feat, self.obj_feat_abs_max)
+        current_rot6d = self._sanitize_obj_tensor(current_rot6d, self.obj_rot6d_abs_max)
+        current_trans_norm = self._sanitize_obj_tensor(current_trans_norm, self.obj_trans_norm_abs_max)
+        pose_input = self._sanitize_obj_tensor(
+            torch.cat((global_obj_feat, obj_center_feat, global_mv_feat, current_rot6d, current_trans_norm), dim=-1),
+            self.obj_feat_abs_max,
+        )
+        raw_delta_pose = self.obj_pose_delta_regressor(pose_input)
+        delta_rot = torch.tanh(raw_delta_pose[:, :6]) * (self.obj_pose_rot_delta_abs_max * warmup_scale)
+        delta_trans = torch.tanh(raw_delta_pose[:, 6:]) * (self.obj_pose_trans_delta_abs_max * warmup_scale)
+        next_rot_seed = self._sanitize_obj_tensor(current_rot6d + delta_rot, self.obj_rot6d_abs_max)
         next_rotmat = rot6d_to_rotmat(next_rot_seed)
-        next_rot6d = rotmat_to_rot6d(next_rotmat)
-        next_trans_norm = current_trans_norm + delta_pose[:, 6:]
+        next_rot6d = self._sanitize_obj_tensor(rotmat_to_rot6d(next_rotmat), self.obj_rot6d_abs_max)
+        next_trans_norm = self._sanitize_obj_tensor(current_trans_norm + delta_trans, self.obj_trans_norm_abs_max)
         return next_rot6d, next_trans_norm
 
-    def build_stage3_context(
+    def build_hand_object_context(
         self,
         obj_template,
         hand_center_point,
         current_rot6d,
         current_trans_norm,
+        obj_view_conf,
+        obj_view_conf_xy,
+        obj_occ_map,
         feat_map,
         img_metas,
         inp_res,
@@ -452,11 +621,14 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         obj_feat_update_scale,
         pose_delta_scale,
     ):
-        return HORStage3Context(
+        return HORHandObjectContext(
             obj_template=obj_template,
             hand_center_point=hand_center_point,
             current_rot6d=current_rot6d,
             current_trans_norm=current_trans_norm,
+            obj_view_conf=obj_view_conf,
+            obj_view_conf_xy=obj_view_conf_xy,
+            obj_occ_map=obj_occ_map,
             feat_map=feat_map,
             img_metas=img_metas,
             inp_res=inp_res,
@@ -465,6 +637,7 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             sample_multiview_features_fn=self.sample_multiview_features,
             project_points_to_views_fn=self.project_points_to_views,
             build_object_points_from_pose_fn=self.build_object_points_from_pose,
+            build_object_point_view_weights_fn=self.build_object_point_view_weights,
             update_object_pose_fn=self.update_object_pose,
             obj_feat_fuser=self.obj_feat_fuser,
             hand_update_scale=hand_update_scale,
@@ -472,8 +645,8 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             pose_delta_scale=pose_delta_scale,
         )
 
-    def build_stage2_context(self, hand_center_point, anchor_verts_xyz_master, anchor_verts_xyz_norm, anchor_verts_feats_norm):
-        return HORStage2Context(
+    def build_hand_refine_context(self, hand_center_point, anchor_verts_xyz_master, anchor_verts_xyz_norm, anchor_verts_feats_norm):
+        return HORHandRefineContext(
             hand_center_point=hand_center_point,
             anchor_verts_xyz_master=anchor_verts_xyz_master,
             anchor_verts_xyz_norm=anchor_verts_xyz_norm,
@@ -489,14 +662,22 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         points_2d = torch.einsum("bijk,k->bijk", points_2d, 1.0 / inp_res)
         return points_2d * 2 - 1
 
-    def sample_multiview_features(self, feat_map, query_2d, batch_size, num_cams, num_points):
+    def sample_multiview_features(self, feat_map, query_2d, batch_size, num_cams, num_points, view_weights=None):
         feat_dim = feat_map.size(2)
         sampled_feats = F.grid_sample(feat_map.flatten(0, 1), query_2d, align_corners=False)
         sampled_feats = sampled_feats.squeeze(-1).reshape(batch_size, num_cams, feat_dim, num_points).permute(0, 3, 1, 2)
         if self.merge_mode == "attn":
-            return self.merge_features_mv(sampled_feats, self.merge_net_feature, torch.zeros(batch_size, dtype=torch.long, device=feat_map.device))
+            return self.merge_features_mv(
+                sampled_feats,
+                self.merge_net_feature,
+                torch.zeros(batch_size, dtype=torch.long, device=feat_map.device),
+                view_weights=view_weights,
+            )
         if self.merge_mode == "sum":
-            return torch.sum(sampled_feats, dim=-2)
+            if view_weights is None:
+                return torch.sum(sampled_feats, dim=-2)
+            view_weights = self._normalize_view_weights(view_weights, num_cams, sampled_feats.dtype).unsqueeze(-1)
+            return torch.sum(sampled_feats * view_weights, dim=-2)
         raise ValueError(f"CAM_FEAT_MERGE must in [attn, sum], default sum, got {self.merge_mode}")
 
     def fuse_hand_joint_features(self, hand_xyz, hand_feats, joint_xyz, joint_feats):
@@ -521,9 +702,26 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
     def forward(self, mlvl_feat, mano_3d_sv, img_metas, reference_hand, reference_obj, obj_template, **kwargs):
         results = dict()
         interaction_mode = kwargs.get("interaction_mode", "ho")
-        stage3_warmup = float(kwargs.get("stage3_warmup", 1.0))
+        # Accept the old kwarg name as a compatibility path during the transition to two-stage naming.
+        stage2_warmup = float(kwargs.get("stage2_warmup", kwargs.get("stage3_warmup", 1.0)))
+        hand_view_conf = kwargs.get("hand_view_conf", None)
+        obj_view_conf = kwargs.get("obj_view_conf", None)
+        obj_view_conf_xy = kwargs.get("obj_view_conf_xy", None)
+        obj_occ_map = kwargs.get("obj_occ_map", None)
+        obj_center_query_2d = kwargs.get("obj_center_query_2d", None)
+        sv_rot_outputs = kwargs.get("sv_rot_outputs", None)
+        obj_init_rot6d = kwargs.get("obj_init_rot6d", None)
         x = mlvl_feat
         batch_size, num_cams = x.size(0), x.size(1)
+        if hand_view_conf is not None:
+            hand_view_conf = hand_view_conf.to(device=x.device, dtype=x.dtype).permute(0, 2, 1).contiguous()
+        if obj_view_conf is not None:
+            obj_view_conf = obj_view_conf.to(device=x.device, dtype=x.dtype).permute(0, 2, 1).contiguous()
+        if obj_view_conf_xy is not None:
+            obj_view_conf_xy = obj_view_conf_xy.to(device=x.device, dtype=x.dtype)
+            obj_view_conf_xy = obj_view_conf_xy.mean(dim=2) if obj_view_conf_xy.dim() == 4 and obj_view_conf_xy.shape[2] > 1 else obj_view_conf_xy.squeeze(2)
+        if obj_occ_map is not None:
+            obj_occ_map = obj_occ_map.to(device=x.device, dtype=x.dtype)
         mano_3d_sv = mano_3d_sv.view(batch_size, num_cams, *mano_3d_sv.shape[1:])  # (B, N, 799, 3)
         batch_idx = torch.arange(batch_size, device=mano_3d_sv.device)
         mano_3d_master = mano_3d_sv[batch_idx, img_metas["master_id"]]  # (B, 799, 3)
@@ -554,8 +752,17 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         ref_hand_mesh_2d = self.project_points_to_views(ref_hand_mesh, img_metas, inp_res)
         ref_hand_joints_2d = self.project_points_to_views(reference_hand, img_metas, inp_res)
         obj_center_2d = self.project_points_to_views(obj_center_point, img_metas, inp_res)
-
-        hand_mesh_feats = self.sample_multiview_features(x, ref_hand_mesh_2d, batch_size, num_cams, ref_hand_mesh.shape[1])
+        if obj_center_query_2d is None:
+            obj_center_query_2d = obj_center_2d
+        hand_mesh_view_conf = self._interpolate_point_view_weights(ref_hand_mesh, reference_hand, hand_view_conf)
+        hand_mesh_feats = self.sample_multiview_features(
+            x,
+            ref_hand_mesh_2d,
+            batch_size,
+            num_cams,
+            ref_hand_mesh.shape[1],
+            view_weights=hand_mesh_view_conf,
+        )
         hand_mesh_xyz_norm = (ref_hand_mesh - hand_center_point) / self.mano_scale
         hand_joints_xyz_norm = (reference_hand - hand_center_point) / self.mano_scale
 
@@ -563,7 +770,21 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             anchor_verts_xyz_norm = hand_mesh_xyz_norm[:, :778]
             anchor_verts_xyz_master = ref_hand_mesh[:, :778]
             anchor_verts_feats_norm = hand_mesh_feats[:, :778]
-            hand_joint_feats = self.sample_multiview_features(x, ref_hand_joints_2d, batch_size, num_cams, reference_hand.shape[1])
+            current_rot6d = self.identity_rot6d.unsqueeze(0).expand(batch_size, -1)
+            current_obj_xyz_norm, current_obj_xyz_master, current_obj_center_master, current_obj_trans = self.build_object_points_from_pose(
+                obj_template,
+                hand_center_point,
+                current_rot6d,
+                obj_trans_norm.squeeze(1),
+            )
+            hand_joint_feats = self.sample_multiview_features(
+                x,
+                ref_hand_joints_2d,
+                batch_size,
+                num_cams,
+                reference_hand.shape[1],
+                view_weights=hand_view_conf,
+            )
             anchor_feats, hand_joint_feats = self.fuse_hand_joint_features(
                 hand_xyz=anchor_verts_xyz_norm,
                 hand_feats=anchor_verts_feats_norm,
@@ -573,24 +794,23 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             anchor_feats = self.hand_anchor_feat_adapter(anchor_feats)
             hand_joint_feats = self.hand_joint_feat_adapter(hand_joint_feats)
 
-            stage2_context = self.build_stage2_context(
+            hand_refine_context = self.build_hand_refine_context(
                 hand_center_point,
                 anchor_verts_xyz_master,
                 anchor_verts_xyz_norm,
                 anchor_feats,
             )
-            transformer_outputs = self.transformer(
+            hand_transformer_outputs = self.hand_transformer(
                 query_xyz=hand_joints_xyz_norm,
                 query_feat=hand_joint_feats,
                 pt_xyz=anchor_verts_xyz_norm,
                 pt_feats=anchor_feats,
-                interaction_mode="hand",
-                stage2_context=stage2_context,
+                hand_refine_context=hand_refine_context,
             )
-            all_hand_xyz = transformer_outputs.all_hand_mesh_xyz_master
-            results["all_hand_joints_xyz_master"] = transformer_outputs.all_hand_joints_xyz_master
-            kp_joint_feats_norm = transformer_outputs.final_hand_mesh_feats_norm[:, 778:]
-            kp_joint_xyz_norm = transformer_outputs.final_hand_mesh_xyz_norm[:, 778:]
+            all_hand_xyz = hand_transformer_outputs.all_hand_mesh_xyz_master
+            results["all_hand_joints_xyz_master"] = hand_transformer_outputs.all_hand_joints_xyz_master
+            kp_joint_feats_norm = hand_transformer_outputs.final_hand_mesh_feats_norm[:, 778:]
+            kp_joint_xyz_norm = hand_transformer_outputs.final_hand_mesh_xyz_norm[:, 778:]
             pred_kp_mano_mesh_xyz_rel, pred_kp_mano_params_master = self.predict_mano_from_tokens(
                 kp_joint_feats_norm,
                 kp_joint_xyz_norm,
@@ -599,26 +819,41 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             pred_kp_mano_mesh_xyz_master = pred_kp_mano_mesh_xyz_rel + hand_center_point
 
             n_layers = all_hand_xyz.shape[0]
-            all_obj_xyz = obj_xyz_master_init.unsqueeze(0).expand(n_layers, -1, -1, -1)
-            all_obj_center = obj_center_point.unsqueeze(0).expand(n_layers, -1, -1, -1)
-            all_obj_rot6d = self.identity_rot6d.view(1, 1, 6).expand(n_layers, batch_size, -1)
-            all_obj_trans = obj_trans_master.squeeze(1).unsqueeze(0).expand(n_layers, -1, -1)
-            results["pred_obj_trans_master"] = obj_trans_master
+            all_obj_xyz = current_obj_xyz_master.unsqueeze(0).expand(n_layers, -1, -1, -1).contiguous()
+            all_obj_center = current_obj_center_master.unsqueeze(0).expand(n_layers, -1, -1, -1).contiguous()
+            all_obj_rot6d = current_rot6d.unsqueeze(0).expand(n_layers, -1, -1).contiguous()
+            all_obj_trans = current_obj_trans.unsqueeze(0).expand(n_layers, -1, -1).contiguous()
+            results["pred_obj_trans_master"] = current_obj_trans.unsqueeze(1)
             pred_mano_mesh_xyz_master = pred_kp_mano_mesh_xyz_master
             pred_mano_params_master = pred_kp_mano_params_master
             results["pred_kp_mano_mesh_xyz_master"] = pred_kp_mano_mesh_xyz_master
             results["pred_kp_mano_params_master"] = pred_kp_mano_params_master
         else:
-            hand_update_scale = self.stage3_hand_update_min_scale + (1.0 - self.stage3_hand_update_min_scale) * stage3_warmup
-            obj_feat_update_scale = self.stage3_obj_feat_min_scale + (1.0 - self.stage3_obj_feat_min_scale) * stage3_warmup
-            pose_delta_scale = self.stage3_pose_delta_min_scale + (1.0 - self.stage3_pose_delta_min_scale) * stage3_warmup
-            init_rot_scale = self.stage3_init_rot_min_scale + (1.0 - self.stage3_init_rot_min_scale) * stage3_warmup
-            obj_center_feat = self.sample_multiview_features(x, obj_center_2d, batch_size, num_cams, 1).squeeze(1)
+            # Freeze the KP hand mesh as the interaction anchor during stage2. Only the
+            # object branch is allowed to adapt its pose to the fixed hand geometry.
+            hand_update_scale = 0.0
+            obj_feat_update_scale = self.stage2_obj_feat_min_scale + (1.0 - self.stage2_obj_feat_min_scale) * stage2_warmup
+            pose_delta_scale = self.stage2_pose_delta_min_scale + (1.0 - self.stage2_pose_delta_min_scale) * stage2_warmup
+            obj_center_feat = self.sample_multiview_features(
+                x,
+                obj_center_query_2d,
+                batch_size,
+                num_cams,
+                1,
+                view_weights=obj_view_conf,
+            ).squeeze(1)
 
             anchor_verts_xyz_norm = hand_mesh_xyz_norm[:, :778]
             anchor_verts_xyz_master = ref_hand_mesh[:, :778]
             anchor_verts_feats_norm = hand_mesh_feats[:, :778]
-            hand_joint_feats = self.sample_multiview_features(x, ref_hand_joints_2d, batch_size, num_cams, reference_hand.shape[1])
+            hand_joint_feats = self.sample_multiview_features(
+                x,
+                ref_hand_joints_2d,
+                batch_size,
+                num_cams,
+                reference_hand.shape[1],
+                view_weights=hand_view_conf,
+            )
             anchor_feats, hand_joint_feats = self.fuse_hand_joint_features(
                 hand_xyz=anchor_verts_xyz_norm,
                 hand_feats=anchor_verts_feats_norm,
@@ -627,23 +862,22 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             )
             anchor_feats = self.hand_anchor_feat_adapter(anchor_feats)
             hand_joint_feats = self.hand_joint_feat_adapter(hand_joint_feats)
-            stage2_context = self.build_stage2_context(
+            hand_refine_context = self.build_hand_refine_context(
                 hand_center_point,
                 anchor_verts_xyz_master,
                 anchor_verts_xyz_norm,
                 anchor_feats,
             )
-            kp_transformer_outputs = self.transformer(
+            hand_transformer_outputs = self.hand_transformer(
                 query_xyz=hand_joints_xyz_norm,
                 query_feat=hand_joint_feats,
                 pt_xyz=anchor_verts_xyz_norm,
                 pt_feats=anchor_feats,
-                interaction_mode="hand",
-                stage2_context=stage2_context,
+                hand_refine_context=hand_refine_context,
             )
-            results["all_hand_joints_xyz_master"] = kp_transformer_outputs.all_hand_joints_xyz_master
-            kp_joint_feats_norm = kp_transformer_outputs.final_hand_mesh_feats_norm[:, 778:]
-            kp_joint_xyz_norm = kp_transformer_outputs.final_hand_mesh_xyz_norm[:, 778:]
+            results["all_hand_joints_xyz_master"] = hand_transformer_outputs.all_hand_joints_xyz_master
+            kp_joint_feats_norm = hand_transformer_outputs.final_hand_mesh_feats_norm[:, 778:]
+            kp_joint_xyz_norm = hand_transformer_outputs.final_hand_mesh_xyz_norm[:, 778:]
             pred_kp_mano_mesh_xyz_rel, pred_kp_mano_params_master = self.predict_mano_from_tokens(
                 kp_joint_feats_norm,
                 kp_joint_xyz_norm,
@@ -659,14 +893,27 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
                 inp_res,
                 batch_size,
                 num_cams,
+                reference_hand=reference_hand,
+                joint_view_weights=hand_view_conf,
             )
-            current_rot6d, global_mv_feat = self.predict_initial_object_rotation(x, obj_center_feat, warmup_scale=init_rot_scale)
+            global_mv_feat = x.mean(dim=(1, 3, 4))
+            if obj_init_rot6d is None and sv_rot_outputs is not None:
+                obj_init_rot6d = sv_rot_outputs.get("obj_init_rot6d", sv_rot_outputs.get("obj_fused_rot6d_sv", None))
+            if obj_init_rot6d is None:
+                obj_init_rot6d = self.identity_rot6d.unsqueeze(0).expand(batch_size, -1)
+            current_rot6d = self._sanitize_obj_tensor(
+                obj_init_rot6d.to(device=x.device, dtype=x.dtype),
+                self.obj_rot6d_abs_max,
+            )
             current_trans_norm = obj_trans_norm.squeeze(1)
-            stage3_context = self.build_stage3_context(
+            hand_object_context = self.build_hand_object_context(
                 obj_template=obj_template,
                 hand_center_point=hand_center_point,
                 current_rot6d=current_rot6d,
                 current_trans_norm=current_trans_norm,
+                obj_view_conf=obj_view_conf.squeeze(1) if obj_view_conf is not None and obj_view_conf.shape[1] == 1 else obj_view_conf,
+                obj_view_conf_xy=obj_view_conf_xy,
+                obj_occ_map=obj_occ_map,
                 feat_map=x,
                 img_metas=img_metas,
                 inp_res=inp_res,
@@ -676,34 +923,32 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
                 obj_feat_update_scale=obj_feat_update_scale,
                 pose_delta_scale=pose_delta_scale,
             )
-            transformer_outputs = self.transformer(
+            ho_transformer_outputs = self.ho_transformer(
                 query_xyz=current_hand_mesh_xyz_norm,
                 query_feat=current_hand_mesh_feats_norm,
-                pt_xyz=None,
-                pt_feats=None,
-                interaction_mode="mesh_obj",
-                stage3_context=stage3_context,
+                hand_object_context=hand_object_context,
             )
 
-            all_hand_xyz = transformer_outputs.all_hand_mesh_xyz_master
-            all_obj_xyz = transformer_outputs.all_obj_xyz_master
-            all_obj_center = transformer_outputs.all_obj_center_xyz_master
-            all_obj_rot6d = transformer_outputs.all_obj_rot6d
-            all_obj_trans = transformer_outputs.all_obj_trans
+            n_layers = ho_transformer_outputs.all_obj_xyz_master.shape[0]
+            all_hand_xyz = pred_kp_mano_mesh_xyz_master.unsqueeze(0).expand(n_layers, -1, -1, -1).contiguous()
+            all_obj_xyz = ho_transformer_outputs.all_obj_xyz_master
+            all_obj_center = ho_transformer_outputs.all_obj_center_xyz_master
+            all_obj_rot6d = ho_transformer_outputs.all_obj_rot6d
+            all_obj_trans = ho_transformer_outputs.all_obj_trans
 
-            pred_mesh_mano_mesh_xyz_rel, pred_mesh_mano_params_master = self.predict_mano_from_tokens(
-                transformer_outputs.final_hand_mesh_feats_norm,
-                transformer_outputs.final_hand_mesh_xyz_norm,
-                self.final_mesh_mano_regressor,
-            )
-            pred_mesh_mano_mesh_xyz_master = pred_mesh_mano_mesh_xyz_rel + hand_center_point
-            pred_mano_mesh_xyz_master = pred_mesh_mano_mesh_xyz_master
-            pred_mano_params_master = pred_mesh_mano_params_master
+            pred_mano_mesh_xyz_master = pred_kp_mano_mesh_xyz_master
+            pred_mano_params_master = pred_kp_mano_params_master
             results["pred_kp_mano_mesh_xyz_master"] = pred_kp_mano_mesh_xyz_master
             results["pred_kp_mano_params_master"] = pred_kp_mano_params_master
-            results["pred_mesh_mano_mesh_xyz_master"] = pred_mesh_mano_mesh_xyz_master
-            results["pred_mesh_mano_params_master"] = pred_mesh_mano_params_master
             results["pred_obj_trans_master"] = all_obj_trans[-1].unsqueeze(1)
+            if sv_rot_outputs is not None:
+                results["obj_view_rot6d_cam"] = sv_rot_outputs.get("obj_view_rot6d_cam", None)
+                results["obj_view_rot6d_master"] = sv_rot_outputs.get("obj_view_rot6d_master", None)
+                results["obj_view_rot_conf"] = sv_rot_outputs.get("obj_view_rot_conf", None)
+                results["obj_view_rot_weights"] = sv_rot_outputs.get("obj_view_rot_weights", None)
+                results["obj_view_rot_valid"] = sv_rot_outputs.get("obj_view_rot_valid", None)
+                results["obj_fused_rot6d_sv"] = sv_rot_outputs.get("obj_fused_rot6d_sv", current_rot6d)
+            results["obj_init_rot6d"] = current_rot6d
 
         results["all_hand_mesh_xyz_master"] = all_hand_xyz
         results["all_obj_xyz_master"] = all_obj_xyz

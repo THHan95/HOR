@@ -6,7 +6,6 @@ from typing import Iterable
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn.utils import clip_grad
 from torch.optim import Optimizer
 
 from .logger import logger
@@ -101,9 +100,32 @@ def clip_gradient(optimizer, max_norm, norm_type):
         max_norm (float): max norm of the gradients
         norm_type (float): type of the used p-norm
     """
+    params = []
     for group in optimizer.param_groups:
         for param in group["params"]:
-            clip_grad.clip_grad_norm_(param, max_norm, norm_type)
+            if param.grad is not None:
+                params.append(param)
+
+    if not params:
+        return 0.0
+
+    norm_type = float(norm_type)
+    if norm_type == float("inf"):
+        total_norm = max(float(param.grad.detach().abs().max().item()) for param in params)
+    else:
+        total_norm_acc = torch.zeros(1, device=params[0].grad.device, dtype=torch.float64)
+        for param in params:
+            param_norm = torch.norm(param.grad.detach().to(dtype=torch.float64), norm_type)
+            total_norm_acc += param_norm.pow(norm_type)
+        total_norm = float(total_norm_acc.pow(1.0 / norm_type).item())
+
+    if np.isfinite(total_norm):
+        clip_coef = float(max_norm) / (total_norm + 1e-6)
+        if clip_coef < 1.0:
+            for param in params:
+                param.grad.detach().mul_(clip_coef)
+
+    return float(total_norm)
 
 
 def setup_seed(seed, conv_repeatable=True):
