@@ -9,6 +9,7 @@ import numpy as np
 from ..metrics.basic_metric import LossMetric
 from ..metrics.mean_epe import MeanEPE
 from ..metrics.object_pose_metric import ObjectPoseMetric
+from ..metrics.object_recon_metric import ObjectReconMetric
 from ..metrics.pa_eval import PAEval
 from ..metrics.rle import RLELoss
 from ..utils.builder import MODEL
@@ -21,12 +22,13 @@ from ..utils.transform import (batch_cam_extr_transf, batch_cam_intr_projection,
 from ..viztools.draw import (draw_batch_joint_images, draw_batch_mesh_images_pred,
                              draw_batch_hand_mesh_images_2d, draw_batch_joint_center_images, draw_batch_joint_pair_overlay_images,
                              draw_batch_joint_triplet_overlay_images, draw_batch_master_space_3d,
+                             draw_batch_joint_confidence_images, draw_batch_obj_view_rotation_images,
                              tile_batch_images)
 # from .common.networks.tgs.models.snowflake.model_spdpp import SnowflakeModelSPDPP
 # from .common.networks.tgs.models.snowflake.model_spdpp import mask_generation
 from .backbones import build_backbone
 from .bricks.conv import ConvBlock
-from .bricks.utils import ManoDecoder, Linear, SelfAttn, HOT, GraphRegression, Proj2World
+from .bricks.utils import ManoDecoder, Linear, SelfAttn, HOT, GraphRegression, Proj2World, orthgonalProj
 from .model_abstraction import ModuleAbstract
 from .heads import build_head
 from pytorch3d.loss import chamfer_distance
@@ -188,6 +190,8 @@ class POEM_RLE(nn.Module, ModuleAbstract):
         self.PA_KP_MASTER = PAEval(cfg, mesh_score=True)
         self.PA_MESH_MASTER = PAEval(cfg, mesh_score=True)
         self.OBJ_POSE_VAL = ObjectPoseMetric(cfg, name="Obj")
+        self.OBJ_RECON_SV = ObjectReconMetric(cfg, name="SVObjRec")
+        self.OBJ_RECON_MASTER = ObjectReconMetric(cfg, name="MasterObjRec")
         self.MPJPE_MASTER_3D = MeanEPE(cfg, "Master_J")
         self.MPVPE_MASTER_3D = MeanEPE(cfg, "Master_V")
         self.MPJPE_KP_MASTER_3D = MeanEPE(cfg, "KP_Master_J")
@@ -249,6 +253,8 @@ class POEM_RLE(nn.Module, ModuleAbstract):
         self._set_module_requires_grad(self.flow_hand, True)
         self._set_module_requires_grad(self.flow_obj, True)
         self._set_module_requires_grad(self.ptEmb_head, True)
+        self._set_module_requires_grad(getattr(self.ptEmb_head, "obj_pose_delta_regressor", None), False)
+        self._set_module_requires_grad(getattr(self.ptEmb_head, "obj_feat_fuser", None), False)
         if hasattr(self.ptEmb_head, "center_shift_layer"):
             self._set_module_requires_grad(self.ptEmb_head.center_shift_layer, False)
         if hasattr(self.ptEmb_head, "position_encoder"):
@@ -257,7 +263,7 @@ class POEM_RLE(nn.Module, ModuleAbstract):
             for block in self.ptEmb_head.hand_transformer._iter_blocks():
                 self._set_module_requires_grad(block.hand_anchor_update_layer, False)
                 self._set_module_requires_grad(block.hand_refine_layer, False)
-        if hasattr(self.ptEmb_head, "ho_transformer"):
+        if hasattr(self.ptEmb_head, "ho_transformer") and hasattr(self.ptEmb_head.ho_transformer, "_iter_blocks"):
             for block in self.ptEmb_head.ho_transformer._iter_blocks():
                 self._set_module_requires_grad(block.obj_update_layer.vec_attn.reg_branch, False)
 
@@ -614,6 +620,37 @@ class POEM_RLE(nn.Module, ModuleAbstract):
         return points_cam, points_2d
 
     @staticmethod
+    def _build_object_points_from_pose(obj_points_rest, rot6d, center):
+        obj_points_rest = torch.nan_to_num(obj_points_rest.detach(), nan=0.0, posinf=10.0, neginf=-10.0).float()
+        rot6d = torch.nan_to_num(rot6d.detach(), nan=0.0, posinf=10.0, neginf=-10.0).float()
+        center = torch.nan_to_num(center.detach(), nan=0.0, posinf=10.0, neginf=-10.0).float()
+
+        if rot6d.dim() == 2:
+            rotmat = rot6d_to_rotmat(rot6d)
+            return torch.matmul(obj_points_rest, rotmat.transpose(1, 2)) + center.unsqueeze(1)
+
+        batch_size, num_cams = rot6d.shape[:2]
+        rotmat = rot6d_to_rotmat(rot6d.reshape(-1, 6)).view(batch_size, num_cams, 3, 3)
+        points = obj_points_rest.unsqueeze(1).expand(-1, num_cams, -1, -1)
+        if center.dim() == 3:
+            center = center.unsqueeze(1)
+        return torch.matmul(points, rotmat.transpose(-1, -2)) + center
+
+    @classmethod
+    def _build_object_points_from_hand_pose(cls, obj_points_rest, rot6d, hand_root, trans_rel):
+        hand_root = torch.nan_to_num(hand_root.detach(), nan=0.0, posinf=10.0, neginf=-10.0).float()
+        trans_rel = torch.nan_to_num(trans_rel.detach(), nan=0.0, posinf=10.0, neginf=-10.0).float()
+        if rot6d.dim() == 2:
+            if hand_root.dim() == 3 and hand_root.shape[-2] == 1:
+                hand_root = hand_root.squeeze(-2)
+            center = hand_root + trans_rel
+        else:
+            if hand_root.dim() == 3:
+                hand_root = hand_root.unsqueeze(1)
+            center = hand_root + trans_rel.unsqueeze(-2)
+        return cls._build_object_points_from_pose(obj_points_rest, rot6d, center)
+
+    @staticmethod
     def _fit_ortho_camera(points_xy, points_uv, visibility=None, eps=1e-6):
         points_xy = torch.nan_to_num(points_xy, nan=0.0, posinf=0.0, neginf=0.0)
         points_uv = torch.nan_to_num(points_uv, nan=0.0, posinf=0.0, neginf=0.0)
@@ -644,7 +681,7 @@ class POEM_RLE(nn.Module, ModuleAbstract):
         img = batch["image"]
         batch_size, n_views = img.shape[:2]
         img_h, img_w = img.shape[-2:]
-        batch_id = min(0, batch_size - 1)
+        batch_id = 0
 
         K_gt = batch["target_cam_intr"]
         T_c2m_gt = torch.linalg.inv(batch["target_cam_extr"])
@@ -652,37 +689,22 @@ class POEM_RLE(nn.Module, ModuleAbstract):
         pred_mano_2d_mesh_sv = preds["mano_2d_mesh_sv"].view(batch_size, n_views, 799, 2)
         pred_mano_2d_joints_sv = pred_mano_2d_mesh_sv[:, :, self.num_hand_verts:]
         pred_mano_2d_verts_sv = pred_mano_2d_mesh_sv[:, :, :self.num_hand_verts]
+        pred_mano_cam_sv = preds.get("mano_cam_sv", None)
 
         pred_ref_joints_2d = preds["pred_hand"].view(batch_size, n_views, self.num_hand_joints, 2)
         pred_ref_center_2d = preds["pred_obj"].view(batch_size, n_views, 1, 2)
+        pred_hand_conf = preds["conf_hand"].view(batch_size, n_views, self.num_hand_joints, -1).mean(dim=-1)
+        pred_obj_conf = preds["conf_obj"].view(batch_size, n_views, self.num_obj_joints, -1).mean(dim=-1)
 
         gt_joints_2d = self._normed_uv_to_pixel(batch["target_joints_uvd"][..., :2], (img_h, img_w))
+        gt_verts_2d_persp = self._normed_uv_to_pixel(batch["target_verts_uvd"][..., :2], (img_h, img_w))
         gt_obj_center_2d = self._normed_uv_to_pixel(batch["target_obj_center_uv"], (img_h, img_w))
         pred_sv_joints_2d = self._normed_uv_to_pixel(pred_mano_2d_joints_sv, (img_h, img_w))
         pred_sv_verts_2d = self._normed_uv_to_pixel(pred_mano_2d_verts_sv, (img_h, img_w))
         pred_ref_joints_2d = self._normed_uv_to_pixel(pred_ref_joints_2d, (img_h, img_w))
         pred_ref_center_2d = self._normed_uv_to_pixel(pred_ref_center_2d, (img_h, img_w))
-        gt_hand_joints_rel = batch.get("target_joints_3d_rel", None)
-        gt_hand_verts_rel = batch.get("target_verts_3d_rel", None)
-        gt_hand_joints_vis = batch.get("target_joints_vis", None)
-        gt_joints_2d_sv = None
-        gt_verts_2d_sv = None
-        if gt_hand_joints_rel is not None:
-            gt_sv_ortho_cam = self._fit_ortho_camera(
-                gt_hand_joints_rel[..., :2],
-                batch["target_joints_uvd"][..., :2],
-                visibility=gt_hand_joints_vis,
-            )
-            gt_joints_2d_sv = self._normed_uv_to_pixel(self._ortho_project_points(gt_hand_joints_rel, gt_sv_ortho_cam), (img_h, img_w))
-        if gt_hand_verts_rel is not None and gt_hand_joints_rel is not None:
-            gt_verts_2d_sv = self._normed_uv_to_pixel(self._ortho_project_points(gt_hand_verts_rel, gt_sv_ortho_cam), (img_h, img_w))
 
-        pred_master_mesh = preds["mano_3d_mesh_master"]
-        _, pred_master_mesh_2d = self._project_master_points(pred_master_mesh, T_c2m_gt, K_gt)
-        pred_master_joints_2d = pred_master_mesh_2d[:, :, self.num_hand_verts:]
-        pred_master_verts_2d = pred_master_mesh_2d[:, :, :self.num_hand_verts]
         pred_kp_master_mesh = preds.get("mano_3d_mesh_kp_master", None)
-        pred_mesh_master_mesh = preds.get("mano_3d_mesh_mesh_master", None)
         if pred_kp_master_mesh is not None:
             _, pred_kp_master_mesh_2d = self._project_master_points(pred_kp_master_mesh, T_c2m_gt, K_gt)
             pred_kp_master_joints_2d = pred_kp_master_mesh_2d[:, :, self.num_hand_verts:]
@@ -690,13 +712,6 @@ class POEM_RLE(nn.Module, ModuleAbstract):
         else:
             pred_kp_master_joints_2d = None
             pred_kp_master_verts_2d = None
-        if pred_mesh_master_mesh is not None:
-            _, pred_mesh_master_mesh_2d = self._project_master_points(pred_mesh_master_mesh, T_c2m_gt, K_gt)
-            pred_mesh_master_joints_2d = pred_mesh_master_mesh_2d[:, :, self.num_hand_verts:]
-            pred_mesh_master_verts_2d = pred_mesh_master_mesh_2d[:, :, :self.num_hand_verts]
-        else:
-            pred_mesh_master_joints_2d = None
-            pred_mesh_master_verts_2d = None
 
         pred_obj_center = preds["obj_center_xyz_master"][-1]
         pred_obj_sparse = preds["obj_xyz_master"][-1]
@@ -706,220 +721,236 @@ class POEM_RLE(nn.Module, ModuleAbstract):
         gt_obj_sparse = batch["master_obj_sparse"]
         _, gt_obj_sparse_2d_proj = self._project_master_points(gt_obj_sparse, T_c2m_gt, K_gt)
 
+        gt_hand_joints_rel = batch.get("target_joints_3d_rel", None)
+        gt_hand_verts_rel = batch.get("target_verts_3d_rel", None)
+        gt_hand_joints_vis = batch.get("target_joints_vis", None)
+        gt_obj_sparse_cam = batch.get("target_obj_pc_sparse", None)
+        gt_hand_joints_cam = batch.get("target_joints_3d", None)
+        gt_obj_t_rel = batch.get("target_t_label_rel", None)
+        gt_sv_ortho_cam = None
+        gt_joints_2d_sv = None
+        gt_verts_2d_sv = None
+        gt_obj_sparse_2d_sv = None
+        gt_obj_center_2d_sv = None
+        if gt_hand_joints_rel is None and gt_hand_joints_cam is not None:
+            gt_hand_root_cam = gt_hand_joints_cam[:, :, self.center_idx:self.center_idx + 1]
+            gt_hand_joints_rel = gt_hand_joints_cam - gt_hand_root_cam
+        if gt_hand_joints_rel is not None:
+            gt_sv_ortho_cam = self._fit_ortho_camera(
+                gt_hand_joints_rel[..., :2],
+                gt_joints_2d,
+                visibility=gt_hand_joints_vis,
+            )
+        if gt_sv_ortho_cam is not None and gt_hand_joints_rel is not None:
+            gt_joints_2d_sv = self._ortho_project_points(gt_hand_joints_rel, gt_sv_ortho_cam)
+        if gt_sv_ortho_cam is not None and gt_hand_verts_rel is not None:
+            gt_verts_2d_sv = self._ortho_project_points(gt_hand_verts_rel, gt_sv_ortho_cam)
+        if gt_sv_ortho_cam is not None and gt_obj_sparse_cam is not None and gt_hand_joints_cam is not None:
+            gt_hand_root_cam = gt_hand_joints_cam[:, :, self.center_idx:self.center_idx + 1]
+            gt_obj_sparse_rel = gt_obj_sparse_cam - gt_hand_root_cam
+            gt_obj_sparse_2d_sv = self._ortho_project_points(gt_obj_sparse_rel, gt_sv_ortho_cam)
+            gt_obj_center_rel = gt_obj_sparse_rel.mean(dim=-2, keepdim=True)
+            gt_obj_center_2d_sv = self._ortho_project_points(gt_obj_center_rel, gt_sv_ortho_cam)
+        if gt_sv_ortho_cam is not None and gt_obj_t_rel is not None:
+            gt_obj_center_rel = gt_obj_t_rel.unsqueeze(-2).to(dtype=gt_sv_ortho_cam.dtype)
+            gt_obj_center_2d_sv = self._ortho_project_points(gt_obj_center_rel, gt_sv_ortho_cam)
+
+        pred_sv_obj_sparse_2d = None
+        pred_sv_obj_center_2d = None
+        if preds.get("obj_view_rot6d_cam", None) is not None and pred_mano_cam_sv is not None:
+            obj_template = batch["master_obj_sparse_rest"].to(device=pred_mano_2d_mesh_sv.device, dtype=pred_mano_2d_mesh_sv.dtype)
+            obj_template = obj_template.unsqueeze(1).expand(-1, n_views, -1, -1)
+            pred_obj_rotmat_sv = rot6d_to_rotmat(
+                preds["obj_view_rot6d_cam"].reshape(-1, 6)
+            ).view(batch_size, n_views, 3, 3).to(dtype=obj_template.dtype)
+            pred_sv_obj_xyz = torch.matmul(obj_template, pred_obj_rotmat_sv.transpose(-1, -2))
+            pred_mano_cam_sv = pred_mano_cam_sv.view(batch_size, n_views, 3).to(dtype=pred_sv_obj_xyz.dtype)
+            pred_sv_obj_sparse_2d = orthgonalProj(
+                pred_sv_obj_xyz[..., :2].clone(),
+                pred_mano_cam_sv[..., 0:1].unsqueeze(-2),
+                torch.zeros_like(pred_mano_cam_sv[..., 1:]).unsqueeze(-2),
+                img_size=img_w,
+            )
+            pred_sv_obj_center_2d = pred_ref_center_2d.clone()
+            pred_sv_obj_sparse_center_2d = pred_sv_obj_sparse_2d.mean(dim=-2, keepdim=True)
+            pred_sv_obj_sparse_2d = pred_sv_obj_sparse_2d + (pred_sv_obj_center_2d - pred_sv_obj_sparse_center_2d)
+            pred_sv_obj_sparse_2d = torch.nan_to_num(pred_sv_obj_sparse_2d, nan=0.0, posinf=max(img_h, img_w), neginf=0.0)
+            pred_sv_obj_center_2d = torch.nan_to_num(pred_sv_obj_center_2d, nan=0.0, posinf=max(img_h, img_w), neginf=0.0)
+
         img_views = img[batch_id]
         gt_joints_2d_views = gt_joints_2d[batch_id]
-        gt_joints_2d_sv_views = gt_joints_2d_sv[batch_id] if gt_joints_2d_sv is not None else gt_joints_2d_views
-        gt_obj_center_2d_views = gt_obj_center_2d[batch_id]
         pred_sv_joints_2d_views = pred_sv_joints_2d[batch_id]
         pred_sv_verts_2d_views = pred_sv_verts_2d[batch_id]
         pred_ref_joints_2d_views = pred_ref_joints_2d[batch_id]
         pred_ref_center_2d_views = pred_ref_center_2d[batch_id]
-        pred_master_joints_2d_views = pred_master_joints_2d[batch_id]
-        pred_master_verts_2d_views = pred_master_verts_2d[batch_id]
+        pred_hand_conf_views = pred_hand_conf[batch_id]
+        pred_obj_conf_views = pred_obj_conf[batch_id]
+        pred_obj_view_rot_conf = preds.get("obj_view_rot_conf", None)
+        pred_obj_view_rot_weights = preds.get("obj_view_rot_weights", None)
+        pred_obj_view_rot_valid = preds.get("obj_view_rot_valid", None)
+        pred_obj_view_rot_deg = None
+        master_view_mask = torch.zeros(n_views, 1, dtype=img.dtype, device=img.device)
+        master_view_mask[batch["master_id"][batch_id].item(), 0] = 1.0
+        best_view_mask = None
+        if pred_obj_view_rot_weights is not None:
+            best_view_mask = torch.zeros(n_views, 1, dtype=img.dtype, device=img.device)
+            best_view_idx = torch.argmax(pred_obj_view_rot_weights[batch_id]).item()
+            best_view_mask[best_view_idx, 0] = 1.0
+        if preds.get("obj_view_rot6d_cam", None) is not None and batch.get("target_rot6d_label", None) is not None:
+            gt_view_rot6d = batch["target_rot6d_label"][batch_id]
+            pred_view_rot6d = preds["obj_view_rot6d_cam"][batch_id]
+            pred_obj_view_rot_deg = torch.rad2deg(
+                self.rotation_geodesic(pred_view_rot6d, gt_view_rot6d)
+            ).unsqueeze(-1)
         pred_kp_master_joints_2d_views = pred_kp_master_joints_2d[batch_id] if pred_kp_master_joints_2d is not None else None
         pred_kp_master_verts_2d_views = pred_kp_master_verts_2d[batch_id] if pred_kp_master_verts_2d is not None else None
-        pred_mesh_master_joints_2d_views = pred_mesh_master_joints_2d[batch_id] if pred_mesh_master_joints_2d is not None else None
-        pred_mesh_master_verts_2d_views = pred_mesh_master_verts_2d[batch_id] if pred_mesh_master_verts_2d is not None else None
         pred_obj_center_2d_views = pred_obj_center_2d_proj[batch_id]
         pred_obj_sparse_2d_views = pred_obj_sparse_2d_proj[batch_id]
-        gt_obj_sparse_2d_views = gt_obj_sparse_2d_proj[batch_id]
-        gt_verts_2d_views = self._normed_uv_to_pixel(batch["target_verts_uvd"][batch_id, ..., :2], (img_h, img_w))
+        pred_sv_obj_sparse_2d_views = pred_sv_obj_sparse_2d[batch_id] if pred_sv_obj_sparse_2d is not None else None
+        pred_sv_obj_center_2d_views = pred_sv_obj_center_2d[batch_id] if pred_sv_obj_center_2d is not None else None
+        gt_obj_sparse_2d_views = batch_cam_intr_projection(K_gt, gt_obj_sparse_cam)[batch_id] if gt_obj_sparse_cam is not None else gt_obj_sparse_2d_proj[batch_id]
+        gt_obj_sparse_2d_sv_views = gt_obj_sparse_2d_views
+        gt_obj_center_2d_sv_views = gt_obj_center_2d[batch_id]
+        gt_joints_2d_sv_views = gt_joints_2d_sv[batch_id] if gt_joints_2d_sv is not None else gt_joints_2d_views
+        gt_verts_2d_views = gt_verts_2d_persp[batch_id]
         gt_verts_2d_sv_views = gt_verts_2d_sv[batch_id] if gt_verts_2d_sv is not None else gt_verts_2d_views
 
         tag_prefix = self._stage_tb_prefix(mode, stage_name)
         self.summary.add_image(
-            f"{tag_prefix}/sv_joints_2d",
-            tile_batch_images(draw_batch_joint_images(pred_sv_joints_2d_views, gt_joints_2d_sv_views, img_views, step_idx, n_sample=n_views)),
+            f"{tag_prefix}/hand_objcenter_confidence_2d",
+            tile_batch_images(
+                draw_batch_joint_confidence_images(
+                    pred_ref_joints_2d_views,
+                    pred_hand_conf_views,
+                    img_views,
+                    obj_center2d=pred_ref_center_2d_views,
+                    obj_conf=pred_obj_conf_views,
+                    n_sample=n_views,
+                )
+            ),
             step_idx,
             dataformats="HWC",
         )
         self.summary.add_image(
-            f"{tag_prefix}/sv_mesh_2d",
-            tile_batch_images(draw_batch_hand_mesh_images_2d(
-                gt_verts2d=gt_verts_2d_sv_views,
-                pred_verts2d=pred_sv_verts_2d_views,
-                face=self.face,
-                tensor_image=img_views,
-                n_sample=n_views,
-            )),
+            f"{tag_prefix}/sv_hand_joints_2d",
+            tile_batch_images(
+                draw_batch_joint_images(
+                    pred_sv_joints_2d_views,
+                    gt_joints_2d_sv_views,
+                    img_views,
+                    step_idx,
+                    n_sample=n_views,
+                )
+            ),
             step_idx,
             dataformats="HWC",
         )
         self.summary.add_image(
-            f"{tag_prefix}/ref_joints_obj_center_2d",
-            tile_batch_images(draw_batch_joint_center_images(pred_ref_joints_2d_views, gt_joints_2d_views, pred_ref_center_2d_views, gt_obj_center_2d_views, img_views, n_sample=n_views)),
-            step_idx,
-            dataformats="HWC",
-        )
-        self.summary.add_image(
-            f"{tag_prefix}/master_joints_2d",
-            tile_batch_images(draw_batch_joint_images(pred_master_joints_2d_views, gt_joints_2d_views, img_views, step_idx, n_sample=n_views)),
-            step_idx,
-            dataformats="HWC",
-        )
-        self.summary.add_image(
-            f"{tag_prefix}/master_mesh_2d",
-            tile_batch_images(draw_batch_hand_mesh_images_2d(
-                gt_verts2d=gt_verts_2d_views,
-                pred_verts2d=pred_master_verts_2d_views,
-                face=self.face,
-                tensor_image=img_views,
-                n_sample=n_views,
-            )),
-            step_idx,
-            dataformats="HWC",
-        )
-        self.summary.add_image(
-            f"{tag_prefix}/joint_triplet_overlay_2d",
-            tile_batch_images(draw_batch_joint_triplet_overlay_images(
-                pred_sv_joints_2d_views,
-                pred_master_joints_2d_views,
-                gt_joints_2d_views,
-                img_views,
-                n_sample=n_views,
-            )),
-            step_idx,
-            dataformats="HWC",
-        )
-        if pred_kp_master_joints_2d_views is not None and stage_name == "stage2":
-            self.summary.add_image(
-                f"{tag_prefix}/kp_master_joints_2d",
-                tile_batch_images(draw_batch_joint_images(pred_kp_master_joints_2d_views, gt_joints_2d_views, img_views, step_idx, n_sample=n_views)),
-                step_idx,
-                dataformats="HWC",
-            )
-            self.summary.add_image(
-                f"{tag_prefix}/kp_master_mesh_2d",
-                tile_batch_images(draw_batch_hand_mesh_images_2d(
-                    gt_verts2d=gt_verts_2d_views,
-                    pred_verts2d=pred_kp_master_verts_2d_views,
+            f"{tag_prefix}/sv_hand_mesh_2d",
+            tile_batch_images(
+                draw_batch_hand_mesh_images_2d(
+                    gt_verts2d=gt_verts_2d_sv_views,
+                    pred_verts2d=pred_sv_verts_2d_views,
                     face=self.face,
                     tensor_image=img_views,
                     n_sample=n_views,
-                )),
-                step_idx,
-                dataformats="HWC",
-            )
-        if pred_mesh_master_joints_2d_views is not None and stage_name == "stage2":
+                )
+            ),
+            step_idx,
+            dataformats="HWC",
+        )
+        if pred_sv_obj_sparse_2d_views is not None and pred_sv_obj_center_2d_views is not None:
             self.summary.add_image(
-                f"{tag_prefix}/mesh_master_joints_2d",
-                tile_batch_images(draw_batch_joint_images(pred_mesh_master_joints_2d_views, gt_joints_2d_views, img_views, step_idx, n_sample=n_views)),
+                f"{tag_prefix}/sv_hand_obj_pose_2d",
+                tile_batch_images(
+                    draw_batch_mesh_images_pred(
+                        gt_verts2d=gt_verts_2d_views,
+                        pred_verts2d=pred_sv_verts_2d_views,
+                        face=self.face,
+                        gt_obj2d=gt_obj_sparse_2d_sv_views,
+                        pred_obj2d=pred_sv_obj_sparse_2d_views,
+                        gt_objc2d=gt_obj_center_2d_sv_views,
+                        pred_objc2d=pred_sv_obj_center_2d_views,
+                        intr=K_gt[batch_id],
+                        tensor_image=img_views,
+                        pred_obj_conf=pred_obj_conf_views,
+                        pred_obj_error=pred_obj_view_rot_deg if pred_obj_view_rot_deg is not None else None,
+                        n_sample=n_views,
+                    )
+                ),
                 step_idx,
                 dataformats="HWC",
             )
+
+        if pred_kp_master_joints_2d_views is not None:
             self.summary.add_image(
-                f"{tag_prefix}/mesh_master_mesh_2d",
-                tile_batch_images(draw_batch_hand_mesh_images_2d(
-                    gt_verts2d=gt_verts_2d_views,
-                    pred_verts2d=pred_mesh_master_verts_2d_views,
-                    face=self.face,
-                    tensor_image=img_views,
-                    n_sample=n_views,
-                )),
+                f"{tag_prefix}/kp_hand_joints_2d",
+                tile_batch_images(
+                    draw_batch_joint_images(
+                        pred_kp_master_joints_2d_views,
+                        gt_joints_2d_views,
+                        img_views,
+                        step_idx,
+                        n_sample=n_views,
+                    )
+                ),
                 step_idx,
                 dataformats="HWC",
             )
-        if stage_name == "stage2":
-            if pred_kp_master_verts_2d_views is not None:
-                self.summary.add_image(
-                    f"{tag_prefix}/kp_master_mesh_obj_2d",
-                    tile_batch_images(draw_batch_mesh_images_pred(
+        if pred_kp_master_verts_2d_views is not None:
+            self.summary.add_image(
+                f"{tag_prefix}/kp_hand_mesh_2d",
+                tile_batch_images(
+                    draw_batch_hand_mesh_images_2d(
                         gt_verts2d=gt_verts_2d_views,
                         pred_verts2d=pred_kp_master_verts_2d_views,
                         face=self.face,
-                        gt_obj2d=gt_obj_sparse_2d_views,
-                        pred_obj2d=pred_obj_sparse_2d_views,
-                        gt_objc2d=gt_obj_center_2d_views,
-                        pred_objc2d=pred_obj_center_2d_views,
-                        intr=K_gt[batch_id],
                         tensor_image=img_views,
                         n_sample=n_views,
-                    )),
+                    )
+                ),
+                step_idx,
+                dataformats="HWC",
+            )
+
+        if stage_name == "stage2":
+            if pred_obj_view_rot_conf is not None and pred_obj_view_rot_weights is not None:
+                self.summary.add_image(
+                    f"{tag_prefix}/rotation_views_2d",
+                    tile_batch_images(
+                        draw_batch_obj_view_rotation_images(
+                            img_views,
+                            pred_obj_view_rot_conf[batch_id].unsqueeze(-1),
+                            pred_obj_view_rot_weights[batch_id].unsqueeze(-1),
+                            rot_deg=pred_obj_view_rot_deg,
+                            valid_mask=pred_obj_view_rot_valid[batch_id].unsqueeze(-1) if pred_obj_view_rot_valid is not None else None,
+                            obj_center2d=pred_ref_center_2d_views,
+                            is_master=master_view_mask,
+                            is_best=best_view_mask,
+                            n_sample=n_views,
+                        )
+                    ),
                     step_idx,
                     dataformats="HWC",
                 )
+            final_hand_verts_2d_views = pred_kp_master_verts_2d_views if pred_kp_master_verts_2d_views is not None else pred_sv_verts_2d_views
             self.summary.add_image(
-                f"{tag_prefix}/master_mesh_obj_2d",
-                tile_batch_images(draw_batch_mesh_images_pred(
-                    gt_verts2d=gt_verts_2d_views,
-                    pred_verts2d=pred_master_verts_2d_views,
-                    face=self.face,
-                    gt_obj2d=gt_obj_sparse_2d_views,
-                    pred_obj2d=pred_obj_sparse_2d_views,
-                    gt_objc2d=gt_obj_center_2d_views,
-                    pred_objc2d=pred_obj_center_2d_views,
-                    intr=K_gt[batch_id],
-                    tensor_image=img_views,
-                    n_sample=n_views,
-                )),
-                step_idx,
-                dataformats="HWC",
-            )
-        pred_hand_master = preds["hand_mesh_xyz_master"][-1]
-        pred_hand_joints_master = pred_hand_master[:, self.num_hand_verts:]
-        pred_hand_verts_master = pred_hand_master[:, :self.num_hand_verts]
-        pred_hand_anchors_master = preds["all_hand_joints_xyz_master"][-1] if "all_hand_joints_xyz_master" in preds else None
-        self.summary.add_image(
-            f"{tag_prefix}/master_space_3d",
-            tile_batch_images(draw_batch_master_space_3d(
-                gt_hand_joints=batch["master_joints_3d"],
-                pred_hand_joints=pred_hand_joints_master,
-                gt_hand_verts=batch["master_verts_3d"],
-                pred_hand_verts=pred_hand_verts_master,
-                gt_obj_pts=batch["master_obj_sparse"] if stage_name == "stage2" else None,
-                pred_obj_pts=pred_obj_sparse if stage_name == "stage2" else None,
-                pred_hand_anchors=pred_hand_anchors_master,
-                n_sample=min(batch_size, 2),
-                image_size=(320, 320),
-            ), max_cols=2),
-            step_idx,
-            dataformats="HWC",
-        )
-        if stage_name == "stage2" and pred_kp_master_mesh is not None:
-            self.summary.add_image(
-                f"{tag_prefix}/kp_master_space_3d",
-                tile_batch_images(draw_batch_master_space_3d(
-                    gt_hand_joints=batch["master_joints_3d"],
-                    pred_hand_joints=pred_kp_master_mesh[:, self.num_hand_verts:],
-                    gt_hand_verts=batch["master_verts_3d"],
-                    pred_hand_verts=pred_kp_master_mesh[:, :self.num_hand_verts],
-                    gt_obj_pts=batch["master_obj_sparse"],
-                    pred_obj_pts=pred_obj_sparse,
-                    pred_hand_anchors=pred_hand_anchors_master,
-                    n_sample=min(batch_size, 2),
-                    image_size=(320, 320),
-                ), max_cols=2),
-                step_idx,
-                dataformats="HWC",
-            )
-        if stage_name == "stage2" and pred_mesh_master_mesh is not None:
-            self.summary.add_image(
-                f"{tag_prefix}/mesh_master_space_3d",
-                tile_batch_images(draw_batch_master_space_3d(
-                    gt_hand_joints=batch["master_joints_3d"],
-                    pred_hand_joints=pred_mesh_master_mesh[:, self.num_hand_verts:],
-                    gt_hand_verts=batch["master_verts_3d"],
-                    pred_hand_verts=pred_mesh_master_mesh[:, :self.num_hand_verts],
-                    gt_obj_pts=batch["master_obj_sparse"],
-                    pred_obj_pts=pred_obj_sparse,
-                    pred_hand_anchors=pred_hand_anchors_master,
-                    n_sample=min(batch_size, 2),
-                    image_size=(320, 320),
-                ), max_cols=2),
-                step_idx,
-                dataformats="HWC",
-            )
-        if preds.get("interaction_mode", "ho") == "hand" and "all_hand_joints_xyz_master" in preds:
-            _, pred_hand_anchor_2d = self._project_master_points(preds["all_hand_joints_xyz_master"][-1], T_c2m_gt, K_gt)
-            pred_hand_anchor_2d_views = pred_hand_anchor_2d[batch_id]
-            self.summary.add_image(
-                f"{tag_prefix}/hand_anchor_refinement_2d",
-                tile_batch_images(draw_batch_joint_pair_overlay_images(
-                    pred_ref_joints_2d_views,
-                    pred_hand_anchor_2d_views,
-                    img_views,
-                    n_sample=n_views,
-                )),
+                f"{tag_prefix}/final_mesh_obj_2d",
+                tile_batch_images(
+                    draw_batch_mesh_images_pred(
+                        gt_verts2d=gt_verts_2d_views,
+                        pred_verts2d=final_hand_verts_2d_views,
+                        face=self.face,
+                        gt_obj2d=gt_obj_sparse_2d_views,
+                        pred_obj2d=pred_obj_sparse_2d_views,
+                        gt_objc2d=gt_obj_center_2d[batch_id],
+                        pred_objc2d=pred_obj_center_2d_views,
+                        intr=K_gt[batch_id],
+                        tensor_image=img_views,
+                        pred_obj_conf=pred_obj_conf_views,
+                        n_sample=n_views,
+                    )
+                ),
                 step_idx,
                 dataformats="HWC",
             )
@@ -1378,6 +1409,8 @@ class POEM_RLE(nn.Module, ModuleAbstract):
         )
         obj_warmup = self._stage2_object_warmup(epoch_idx, stage_name) if epoch_idx is not None else float(enable_object_refine)
         obj_prior_warmup = obj_warmup if stage_name == "stage2" else 1.0
+        master_obj_rot_geo_weight = self.obj_view_rot_weight if enable_master_object_rotation else self.obj_pose_rot_weight
+        master_obj_rot_l1_weight = self.obj_view_rot6d_weight if enable_master_object_rotation else self.obj_pose_rot6d_weight
 
         loss_dict = {}
 
@@ -1620,8 +1653,8 @@ class POEM_RLE(nn.Module, ModuleAbstract):
                     posinf=self.data_preset_cfg.BBOX_3D_SIZE * 8.0,
                     neginf=-self.data_preset_cfg.BBOX_3D_SIZE * 8.0,
                 )
-                loss_obj_rot_geo = torch.mean(self.rotation_geodesic(pred_obj_rot6d_i, master_obj_rot6d_gt)) * self.obj_pose_rot_weight * obj_warmup
-                loss_obj_rot_l1 = self.coord_loss(pred_obj_rot6d_i, master_obj_rot6d_gt) * self.obj_pose_rot6d_weight * obj_warmup
+                loss_obj_rot_geo = torch.mean(self.rotation_geodesic(pred_obj_rot6d_i, master_obj_rot6d_gt)) * master_obj_rot_geo_weight * obj_warmup
+                loss_obj_rot_l1 = self.coord_loss(pred_obj_rot6d_i, master_obj_rot6d_gt) * master_obj_rot_l1_weight * obj_warmup
                 loss_obj_rot = loss_obj_rot_geo + loss_obj_rot_l1
                 loss_obj_trans = self.coord_loss(pred_obj_trans_i, master_obj_trans_gt) * self.obj_pose_trans_weight * obj_warmup
                 loss_obj_points = self.coord_loss(pred_obj_points_i, master_obj_sparse_gt) * self.obj_pose_points_weight * obj_warmup
@@ -1802,6 +1835,18 @@ class POEM_RLE(nn.Module, ModuleAbstract):
             self.MPVPE_MESH_MASTER_3D.feed(pred_mano_3d_mesh_mesh_master[:, :self.num_hand_verts], gt_kp=verts_3d_master_gt)
         self.MPRPE_HAND_3D.feed(pred_ref_hand_joints_3d, gt_kp=joints_3d_master_gt)
         self.MPRPE_OBJ_3D.feed(pred_ref_obj_joints_3d, gt_kp=obj_center_3d_master_gt)
+        self.OBJ_RECON_MASTER.feed(pred_obj_sparse_3d, obj_sparse_3d_master_gt)
+        if obj_pc_sparse is not None and preds.get("obj_view_rot6d_cam", None) is not None:
+            pred_ref_obj_cam = batch_cam_extr_transf(
+                torch.linalg.inv(batch["target_cam_extr"]),
+                preds["ref_obj"].unsqueeze(1).repeat(1, n_views, 1, 1),
+            )
+            pred_sv_obj_sparse_3d = self._build_object_points_from_pose(
+                batch["master_obj_sparse_rest"],
+                preds["obj_view_rot6d_cam"],
+                pred_ref_obj_cam,
+            )
+            self.OBJ_RECON_SV.feed(pred_sv_obj_sparse_3d.flatten(0, 1), obj_pc_sparse.flatten(0, 1))
         self.loss_metric.feed({**loss_dict, **pose_metric_dict, **sv_obj_metric_dict}, batch_size)
         self._maybe_log_stage_transition_loss("train", epoch_idx, stage_name, loss_dict, {**pose_metric_dict, **sv_obj_metric_dict})
 
@@ -1820,6 +1865,12 @@ class POEM_RLE(nn.Module, ModuleAbstract):
             self.summary.add_scalar("MPVPE_MESH_MASTER_3D", self.MPVPE_MESH_MASTER_3D.get_result(), step_idx)
             self.summary.add_scalar("MPRPE_HAND_3D", self.MPRPE_HAND_3D.get_result(), step_idx)
             self.summary.add_scalar("MPRPE_OBJ_3D", self.MPRPE_OBJ_3D.get_result(), step_idx)
+            self.summary.add_scalar("OBJREC_MASTER_CD", self.OBJ_RECON_MASTER.cd.avg, step_idx)
+            self.summary.add_scalar("OBJREC_MASTER_FS_5", self.OBJ_RECON_MASTER.fs_5.avg, step_idx)
+            self.summary.add_scalar("OBJREC_MASTER_FS_10", self.OBJ_RECON_MASTER.fs_10.avg, step_idx)
+            self.summary.add_scalar("OBJREC_SV_CD", self.OBJ_RECON_SV.cd.avg, step_idx)
+            self.summary.add_scalar("OBJREC_SV_FS_5", self.OBJ_RECON_SV.fs_5.avg, step_idx)
+            self.summary.add_scalar("OBJREC_SV_FS_10", self.OBJ_RECON_SV.fs_10.avg, step_idx)
             if step_idx % (self.train_log_interval * 10) == 0:
                 if loss_is_finite and pose_metrics_finite:
                     with torch.no_grad():
@@ -1840,7 +1891,8 @@ class POEM_RLE(nn.Module, ModuleAbstract):
             self.MPJPE_MASTER_3D, self.MPVPE_MASTER_3D,
             self.MPJPE_KP_MASTER_3D, self.MPVPE_KP_MASTER_3D,
             self.MPJPE_MESH_MASTER_3D, self.MPVPE_MESH_MASTER_3D,
-            self.MPRPE_HAND_3D, self.MPRPE_OBJ_3D
+            self.MPRPE_HAND_3D, self.MPRPE_OBJ_3D,
+            self.OBJ_RECON_SV, self.OBJ_RECON_MASTER,
         ], epoch_idx, comment=comment)
         self.loss_metric.reset()
         self.MPJPE_SV_3D.reset()
@@ -1853,6 +1905,8 @@ class POEM_RLE(nn.Module, ModuleAbstract):
         self.MPVPE_MESH_MASTER_3D.reset()
         self.MPRPE_HAND_3D.reset()
         self.MPRPE_OBJ_3D.reset()
+        self.OBJ_RECON_SV.reset()
+        self.OBJ_RECON_MASTER.reset()
 
     def validation_step(self, batch, step_idx, **kwargs):
         img = batch["image"]
@@ -1952,6 +2006,58 @@ class POEM_RLE(nn.Module, ModuleAbstract):
             self.PA_MESH_MASTER.feed(
                 pred_mano_3d_joints_mesh_master_in_cam, joints_3d_gt, pred_mano_3d_verts_mesh_master_in_cam, verts_3d_gt
             )
+        obj_eval_rest = batch.get("master_obj_eval_rest", None)
+        if obj_eval_rest is not None and preds.get("obj_rot6d", None) is not None and preds.get("obj_trans", None) is not None:
+            pred_obj_dense_3d = self._build_object_points_from_hand_pose(
+                obj_eval_rest,
+                preds["obj_rot6d"][-1],
+                pred_mano_3d_joints_master[:, self.center_idx:self.center_idx + 1],
+                preds["obj_trans"][-1],
+            )
+            gt_obj_dense_3d = self._build_object_points_from_hand_pose(
+                obj_eval_rest,
+                batch["master_obj_rot6d_label"],
+                joints_3d_master_gt[:, self.center_idx:self.center_idx + 1],
+                batch["master_obj_t_label_rel"],
+            )
+            self.OBJ_RECON_MASTER.feed(pred_obj_dense_3d, gt_obj_dense_3d)
+        else:
+            self.OBJ_RECON_MASTER.feed(pred_obj_sparse_3d, obj_sparse_3d_master_gt)
+
+        if (
+            obj_eval_rest is not None
+            and preds.get("obj_view_rot6d_cam", None) is not None
+            and batch.get("target_rot6d_label", None) is not None
+            and batch.get("target_t_label_rel", None) is not None
+            and batch.get("target_joints_3d", None) is not None
+        ):
+            pred_ref_obj_cam = batch_cam_extr_transf(
+                torch.linalg.inv(batch["target_cam_extr"]),
+                preds["ref_obj"].unsqueeze(1).repeat(1, n_views, 1, 1),
+            )
+            pred_sv_obj_dense_3d = self._build_object_points_from_pose(
+                obj_eval_rest,
+                preds["obj_view_rot6d_cam"],
+                pred_ref_obj_cam,
+            )
+            gt_sv_obj_dense_3d = self._build_object_points_from_hand_pose(
+                obj_eval_rest,
+                batch["target_rot6d_label"],
+                batch["target_joints_3d"][:, :, self.center_idx:self.center_idx + 1],
+                batch["target_t_label_rel"],
+            )
+            self.OBJ_RECON_SV.feed(pred_sv_obj_dense_3d.flatten(0, 1), gt_sv_obj_dense_3d.flatten(0, 1))
+        elif obj_pc_sparse is not None and preds.get("obj_view_rot6d_cam", None) is not None:
+            pred_ref_obj_cam = batch_cam_extr_transf(
+                torch.linalg.inv(batch["target_cam_extr"]),
+                preds["ref_obj"].unsqueeze(1).repeat(1, n_views, 1, 1),
+            )
+            pred_sv_obj_sparse_3d = self._build_object_points_from_pose(
+                batch["master_obj_sparse_rest"],
+                preds["obj_view_rot6d_cam"],
+                pred_ref_obj_cam,
+            )
+            self.OBJ_RECON_SV.feed(pred_sv_obj_sparse_3d.flatten(0, 1), obj_pc_sparse.flatten(0, 1))
 
         self.summary.add_scalar("MPJPE_SV_3D_val", self.MPJPE_SV_3D.get_result(), step_idx)
         self.summary.add_scalar("MPVPE_SV_3D_val", self.MPVPE_SV_3D.get_result(), step_idx)
@@ -1966,6 +2072,12 @@ class POEM_RLE(nn.Module, ModuleAbstract):
         self.summary.add_scalar("PA_SV_val", self.PA_SV.get_result(), step_idx)
         self.summary.add_scalar("PA_KP_MASTER_val", self.PA_KP_MASTER.get_result(), step_idx)
         self.summary.add_scalar("PA_MESH_MASTER_val", self.PA_MESH_MASTER.get_result(), step_idx)
+        self.summary.add_scalar("OBJREC_MASTER_CD_val", self.OBJ_RECON_MASTER.cd.avg, step_idx)
+        self.summary.add_scalar("OBJREC_MASTER_FS_5_val", self.OBJ_RECON_MASTER.fs_5.avg, step_idx)
+        self.summary.add_scalar("OBJREC_MASTER_FS_10_val", self.OBJ_RECON_MASTER.fs_10.avg, step_idx)
+        self.summary.add_scalar("OBJREC_SV_CD_val", self.OBJ_RECON_SV.cd.avg, step_idx)
+        self.summary.add_scalar("OBJREC_SV_FS_5_val", self.OBJ_RECON_SV.fs_5.avg, step_idx)
+        self.summary.add_scalar("OBJREC_SV_FS_10_val", self.OBJ_RECON_SV.fs_10.avg, step_idx)
         if stage_name == "stage2":
             self.OBJ_POSE_VAL.feed(
                 pred_rot6d=preds["obj_rot6d"][-1],
@@ -1982,6 +2094,7 @@ class POEM_RLE(nn.Module, ModuleAbstract):
             self.summary.add_scalar("OBJ_CENTER_EPE_val", obj_measures["Obj_center_epe"], step_idx)
             self.summary.add_scalar("OBJ_TRANS_EPE_val", obj_measures["Obj_trans_epe"], step_idx)
             self.summary.add_scalar("OBJ_ROT_DEG_val", obj_measures["Obj_rot_deg"], step_idx)
+        self.loss_metric.feed({**pose_metric_dict, **sv_obj_metric_dict}, batch_size)
         for k, v in {**pose_metric_dict, **sv_obj_metric_dict}.items():
             self.summary.add_scalar(f"{k}_val", v.item(), step_idx)
         self._maybe_log_stage_transition_loss("val", epoch_idx, stage_name, {}, {**pose_metric_dict, **sv_obj_metric_dict})
@@ -2000,7 +2113,7 @@ class POEM_RLE(nn.Module, ModuleAbstract):
             self.MPJPE_MESH_MASTER_3D, self.MPVPE_MESH_MASTER_3D,
             self.MPRPE_HAND_3D, self.MPRPE_OBJ_3D,
             self.PA_SV, self.PA_KP_MASTER, self.PA_MESH_MASTER,
-            self.OBJ_POSE_VAL,
+            self.OBJ_POSE_VAL, self.OBJ_RECON_SV, self.OBJ_RECON_MASTER,
         ], epoch_idx, comment=comment, summary=self.format_metric(mode="val_full"))
         self.MPJPE_SV_3D.reset()
         self.MPVPE_SV_3D.reset()
@@ -2016,6 +2129,9 @@ class POEM_RLE(nn.Module, ModuleAbstract):
         self.PA_KP_MASTER.reset()
         self.PA_MESH_MASTER.reset()
         self.OBJ_POSE_VAL.reset()
+        self.OBJ_RECON_SV.reset()
+        self.OBJ_RECON_MASTER.reset()
+        self.loss_metric.reset()
 
     def testing_step(self, batch, step_idx, **kwargs):
         """
@@ -2111,16 +2227,27 @@ class POEM_RLE(nn.Module, ModuleAbstract):
         def _fmt_mm_pair(v1, v2):
             return f"{float(v1) * 1000.0:.4f}/{float(v2) * 1000.0:.4f}"
 
+        def _fmt_obj_recon(metric):
+            return (
+                f"{metric.fs_5.avg:.4f}/"
+                f"{metric.fs_10.avg:.4f}/"
+                f"{metric.cd.avg:.4f}"
+            )
+
+        def _get_loss(name, default=0.0):
+            meter = self.loss_metric._losses.get(name, None)
+            return float(meter.avg) if meter is not None else float(default)
+
         if mode == "train":
-            l_rle = self.loss_metric.get_loss("loss_rle_hand") + self.loss_metric.get_loss("loss_rle_obj")
-            l_obj_pose = self.loss_metric.get_loss("loss_obj_pose")
-            m_obj_rot_deg = self.loss_metric.get_loss("metric_obj_rot_deg")
-            m_obj_trans = self.loss_metric.get_loss("metric_obj_trans_epe")
-            m_sv_obj_rot_deg = self.loss_metric.get_loss("metric_sv_obj_rot_deg")
-            l_total = self.loss_metric.get_loss("loss")
-            l_triang = self.loss_metric.get_loss("loss_triang")
-            l_3d_jts = self.loss_metric.get_loss("loss_3d_jts")
-            l_2d_proj = self.loss_metric.get_loss("loss_2d_proj")
+            l_rle = _get_loss("loss_rle_hand") + _get_loss("loss_rle_obj")
+            l_obj_pose = _get_loss("loss_obj_pose")
+            m_obj_rot_deg = _get_loss("metric_obj_rot_deg")
+            m_obj_trans = _get_loss("metric_obj_trans_epe")
+            m_sv_obj_rot_deg = _get_loss("metric_sv_obj_rot_deg")
+            l_total = _get_loss("loss")
+            l_triang = _get_loss("loss_triang")
+            l_3d_jts = _get_loss("loss_3d_jts")
+            l_2d_proj = _get_loss("loss_2d_proj")
 
             stage_short = self._stage_display_name(self.current_stage_name, short=True)
             warmup_suffix = f" W{self.current_stage2_warmup:.2f}" if self.current_stage_name == "stage2" and self.current_stage2_warmup < 1.0 else ""
@@ -2133,6 +2260,8 @@ class POEM_RLE(nn.Module, ModuleAbstract):
                         f"J3DL {l_3d_jts:.3f} | "
                         f"Proj2DL {l_2d_proj:.3f} | "
                         f"SVRot {m_sv_obj_rot_deg:.1f} | "
+                        f"SVObjRec {_fmt_obj_recon(self.OBJ_RECON_SV)} | "
+                        f"MasterObjRec {_fmt_obj_recon(self.OBJ_RECON_MASTER)} | "
                         f"KPJ {_fmt_mm_value(kp_j)} | "
                         f"KPV {_fmt_mm_value(kp_v)}")
             kp_j = self.MPJPE_KP_MASTER_3D.get_result()
@@ -2146,6 +2275,8 @@ class POEM_RLE(nn.Module, ModuleAbstract):
                     f"RLE {l_rle:.3f} | "
                     f"ObjPoseL {l_obj_pose:.3f} | "
                     f"SVRot {m_sv_obj_rot_deg:.1f} | "
+                    f"SVObjRec {_fmt_obj_recon(self.OBJ_RECON_SV)} | "
+                    f"MasterObjRec {_fmt_obj_recon(self.OBJ_RECON_MASTER)} | "
                     f"Rot {m_obj_rot_deg:.1f} | "
                     f"Tr {_fmt_mm_value(m_obj_trans)}")
         elif mode == "test":
@@ -2162,7 +2293,7 @@ class POEM_RLE(nn.Module, ModuleAbstract):
             mesh_v = self.MPVPE_MESH_MASTER_3D.get_result()
             ref_j = self.MPRPE_HAND_3D.get_result()
             ref_o = self.MPRPE_OBJ_3D.get_result()
-            sv_obj_rot_deg = self.loss_metric.get_loss('metric_sv_obj_rot_deg')
+            sv_obj_rot_deg = _get_loss('metric_sv_obj_rot_deg')
 
             def _fmt_triplet(name, pa_dict, mp, mv):
                 if mp <= 0 and mv <= 0:
@@ -2201,6 +2332,8 @@ class POEM_RLE(nn.Module, ModuleAbstract):
                         if self.current_stage_name in ["stage1", "stage2"] else
                         "SVObjectRot -"
                     ),
+                    f"SVObjectRecon FS@5/10/CD {_fmt_obj_recon(self.OBJ_RECON_SV)}",
+                    f"MasterObjectRecon FS@5/10/CD {_fmt_obj_recon(self.OBJ_RECON_MASTER)}",
                     f"Reference Hand/Object {_fmt_mm_pair(ref_j, ref_o)}",
                 ])
                 return msg
@@ -2217,6 +2350,8 @@ class POEM_RLE(nn.Module, ModuleAbstract):
                     if self.current_stage_name in ["stage1", "stage2"] else
                     "SVRot -"
                 ),
+                f"SVObjRec {_fmt_obj_recon(self.OBJ_RECON_SV)}",
+                f"MasterObjRec {_fmt_obj_recon(self.OBJ_RECON_MASTER)}",
                 f"Ref {_fmt_mm_pair(ref_j, ref_o)}",
             ])
             return msg

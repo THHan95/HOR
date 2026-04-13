@@ -121,8 +121,9 @@ class DexYCB(HDataset):
         self.obj_rest_corners = {}
         self.obj_pc_sparse = {}
         self.obj_pc_dense = {}
+        self.obj_pc_eval = {}
 
-        logger.info("Pre-sampling YCB objects (Sparse: 2048, Dense: 16384)...")
+        logger.info("Pre-sampling YCB objects (Sparse: 2048, Dense: 16384, Eval: 30000)...")
         for obj_id, obj_file in self.dex_ycb.obj_file.items():
             object_mesh = trimesh.load(obj_file, process=False)
 
@@ -132,10 +133,12 @@ class DexYCB(HDataset):
 
             pc_sparse = sample_points_from_meshes(pt3d_mesh, 2048)[0].numpy()
             pc_dense = sample_points_from_meshes(pt3d_mesh, 16384)[0].numpy()
+            pc_eval = sample_points_from_meshes(pt3d_mesh, 30000)[0].numpy()
 
             self.obj_rest_corners[obj_id] = trimesh.bounds.corners(object_mesh.bounds)
             self.obj_pc_sparse[obj_id] = pc_sparse.astype(np.float32)
             self.obj_pc_dense[obj_id] = pc_dense.astype(np.float32)
+            self.obj_pc_eval[obj_id] = pc_eval.astype(np.float32)
 
         logger.info("YCB dual-scale point clouds loaded successfully!")
 
@@ -172,6 +175,7 @@ class DexYCB(HDataset):
 
         pc_sparse_rest = self.obj_pc_sparse[obj_id]
         pc_dense_rest = self.obj_pc_dense[obj_id]
+        pc_eval_rest = self.obj_pc_eval[obj_id]
 
         hand_joints_3d = self.get_joints_3d(idx)
         hand_root_cam = hand_joints_3d[9].reshape(3, 1)
@@ -193,6 +197,7 @@ class DexYCB(HDataset):
             "t_label_rel": t_label_rel.flatten(),
             "rot6d_label": rot6d_label,
             "sparse_rest": pc_sparse_rest,
+            "eval_rest": pc_eval_rest,
             "sparse_cam": pc_sparse_cam.astype(np.float32),
             "dense_cam": pc_dense_cam.astype(np.float32),
         }
@@ -578,6 +583,7 @@ class DexYCBMultiView(torch.utils.data.Dataset):
             master_verts_3d = sample["target_verts_3d_no_rot"][new_master_id]
             master_obj_sparse = sample["target_obj_sparse_no_rot"][new_master_id]
             master_obj_sparse_rest = sample["target_obj_pc_sparse_rest"][new_master_id]
+            master_obj_eval_rest = sample["target_obj_pc_eval_rest"][new_master_id]
             master_obj_rot6d_label = sample["target_rot6d_label"][new_master_id]
             master_obj_t_label_rel = sample["target_t_label_rel"][new_master_id]
             master_obj_center = sample["target_obj_center_3d_no_rot"][new_master_id]
@@ -591,6 +597,7 @@ class DexYCBMultiView(torch.utils.data.Dataset):
             master_verts_3d = sample["target_verts_3d_no_rot"][new_master_id]
             master_obj_sparse = sample["target_obj_sparse_no_rot"][new_master_id]
             master_obj_sparse_rest = sample["target_obj_pc_sparse_rest"][new_master_id]
+            master_obj_eval_rest = sample["target_obj_pc_eval_rest"][new_master_id]
             master_obj_rot6d_label = sample["target_rot6d_label"][new_master_id]
             master_obj_t_label_rel = sample["target_t_label_rel"][new_master_id]
             master_obj_center = sample["target_obj_center_3d_no_rot"][new_master_id]
@@ -614,9 +621,13 @@ class DexYCBMultiView(torch.utils.data.Dataset):
         sample["master_verts_3d"] = master_verts_3d
         sample["master_obj_sparse"] = master_obj_sparse
         sample["master_obj_sparse_rest"] = master_obj_sparse_rest
+        sample["master_obj_eval_rest"] = master_obj_eval_rest
         sample["master_obj_rot6d_label"] = master_obj_rot6d_label
         sample["master_obj_t_label_rel"] = master_obj_t_label_rel
         sample["master_obj_center"] = master_obj_center
+
+        if "target_obj_pc_eval_rest" in sample:
+            del sample["target_obj_pc_eval_rest"]
 
         # Default DataLoader collation in worker processes can fail on numpy views
         # with non-standard strides. Materialize contiguous arrays before return.

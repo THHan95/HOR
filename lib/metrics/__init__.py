@@ -3,3 +3,4 @@ from .pck import Joint3DPCK, Vert3DPCK
 from .mean_epe import MeanEPE
 from .pa_eval import PAEval
 from .object_pose_metric import ObjectPoseMetric
+from .object_recon_metric import ObjectReconMetric

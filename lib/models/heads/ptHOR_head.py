@@ -283,7 +283,9 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         del self.transformer
         ho_transformer_cfg = self.cfg_transformer.clone()
         ho_transformer_cfg.defrost()
-        ho_transformer_cfg.TYPE = "HORTR_HO"
+        ho_transformer_cfg.TYPE = "HORTR_HO_Light"
+        ho_transformer_cfg.OBJ_POSE_ROT_DELTA_ABS_MAX = self.obj_pose_rot_delta_abs_max
+        ho_transformer_cfg.OBJ_POSE_TRANS_DELTA_ABS_MAX = self.obj_pose_trans_delta_abs_max
         ho_transformer_cfg.freeze()
         self.ho_transformer = build_transformer(ho_transformer_cfg)
 
@@ -607,6 +609,7 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         self,
         obj_template,
         hand_center_point,
+        hand_mesh_master,
         current_rot6d,
         current_trans_norm,
         obj_view_conf,
@@ -624,6 +627,7 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         return HORHandObjectContext(
             obj_template=obj_template,
             hand_center_point=hand_center_point,
+            hand_mesh_master=hand_mesh_master,
             current_rot6d=current_rot6d,
             current_trans_norm=current_trans_norm,
             obj_view_conf=obj_view_conf,
@@ -829,8 +833,9 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             results["pred_kp_mano_mesh_xyz_master"] = pred_kp_mano_mesh_xyz_master
             results["pred_kp_mano_params_master"] = pred_kp_mano_params_master
         else:
-            # Freeze the KP hand mesh as the interaction anchor during stage2. Only the
-            # object branch is allowed to adapt its pose to the fixed hand geometry.
+            # Freeze the KP hand mesh as the interaction anchor during stage2. The
+            # object branch only interacts with the fixed hand mesh once, then
+            # directly regresses the final master pose.
             hand_update_scale = 0.0
             obj_feat_update_scale = self.stage2_obj_feat_min_scale + (1.0 - self.stage2_obj_feat_min_scale) * stage2_warmup
             pose_delta_scale = self.stage2_pose_delta_min_scale + (1.0 - self.stage2_pose_delta_min_scale) * stage2_warmup
@@ -906,9 +911,35 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
                 self.obj_rot6d_abs_max,
             )
             current_trans_norm = obj_trans_norm.squeeze(1)
+            current_obj_xyz_norm, current_obj_xyz_master, current_obj_center_master, _ = self.build_object_points_from_pose(
+                obj_template,
+                hand_center_point,
+                current_rot6d,
+                current_trans_norm,
+            )
+            obj_point_view_weights = self.build_object_point_view_weights(
+                current_obj_xyz_master,
+                current_obj_center_master,
+                img_metas,
+                inp_res,
+                obj_view_conf.squeeze(1) if obj_view_conf is not None and obj_view_conf.shape[1] == 1 else obj_view_conf,
+                obj_view_conf_xy,
+                obj_occ_map,
+            )
+            current_obj_query_2d = self.project_points_to_views(current_obj_xyz_master, img_metas, inp_res)
+            current_obj_feats = self.sample_multiview_features(
+                x,
+                current_obj_query_2d,
+                batch_size,
+                num_cams,
+                current_obj_xyz_master.shape[1],
+                view_weights=obj_point_view_weights,
+            )
+            current_obj_feats = self._sanitize_obj_tensor(current_obj_feats, self.obj_feat_abs_max)
             hand_object_context = self.build_hand_object_context(
                 obj_template=obj_template,
                 hand_center_point=hand_center_point,
+                hand_mesh_master=pred_kp_mano_mesh_xyz_master,
                 current_rot6d=current_rot6d,
                 current_trans_norm=current_trans_norm,
                 obj_view_conf=obj_view_conf.squeeze(1) if obj_view_conf is not None and obj_view_conf.shape[1] == 1 else obj_view_conf,
@@ -924,8 +955,10 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
                 pose_delta_scale=pose_delta_scale,
             )
             ho_transformer_outputs = self.ho_transformer(
-                query_xyz=current_hand_mesh_xyz_norm,
-                query_feat=current_hand_mesh_feats_norm,
+                query_xyz=current_obj_xyz_norm,
+                query_feat=current_obj_feats,
+                pt_xyz=current_hand_mesh_xyz_norm,
+                pt_feats=current_hand_mesh_feats_norm,
                 hand_object_context=hand_object_context,
             )
 

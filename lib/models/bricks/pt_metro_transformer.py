@@ -5,6 +5,7 @@ from transformers.models.bert.modeling_bert import (BertAttention, BertIntermedi
                                                     apply_chunking_to_forward)
 
 from .point_transformers import ptTransformerBlock, ptTransformerBlock_CrossAttn
+from ...utils.transform import rot6d_to_rotmat, rotmat_to_rot6d
 
 class pointer_layer(nn.Module):
 
@@ -41,6 +42,88 @@ class pointer_layer(nn.Module):
             query_xyz = (self.obj_xyz_update_scale * query_delta) + query_xyz
 
         return query_feat, query_xyz
+
+
+class pointer_layer_obj_pose(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+
+        self.nneighbor_cross = config.n_neighbor
+        self.nneighbor_query = config.n_neighbor_query
+        self.feat_dim = config.img_feature_dim
+        self.transformer_dim = self.feat_dim
+        self.init_block = config.init_block
+        self.obj_pose_rot_delta_abs_max = getattr(config, "obj_pose_rot_delta_abs_max", 0.2)
+        self.obj_pose_trans_delta_abs_max = getattr(config, "obj_pose_trans_delta_abs_max", 0.1)
+
+        self.query_self_attn = ptTransformerBlock(
+            self.feat_dim,
+            self.transformer_dim,
+            self.nneighbor_query,
+            self.init_block,
+        )
+        self.query_cross_attn = ptTransformerBlock_CrossAttn(
+            self.feat_dim,
+            self.transformer_dim,
+            self.nneighbor_cross,
+            expand_query_dim=False,
+            IFPS=self.init_block,
+        )
+        self.pose_context_proj = nn.Sequential(
+            nn.Linear((self.feat_dim * 3) + 9, self.feat_dim),
+            nn.ReLU(),
+            nn.Linear(self.feat_dim, self.feat_dim),
+        )
+        self.rot_branch = nn.Sequential(
+            nn.Linear(self.feat_dim, self.feat_dim),
+            nn.ReLU(),
+            nn.Linear(self.feat_dim, 6),
+        )
+        self.trans_branch = nn.Sequential(
+            nn.Linear(self.feat_dim, self.feat_dim),
+            nn.ReLU(),
+            nn.Linear(self.feat_dim, 3),
+        )
+
+    @staticmethod
+    def _sanitize_pose_tensor(x, abs_max):
+        return torch.nan_to_num(x, nan=0.0, posinf=abs_max, neginf=-abs_max).clamp(-abs_max, abs_max)
+
+    @staticmethod
+    def _project_delta_rot6d(rot6d):
+        rotmat = rot6d_to_rotmat(rot6d)
+        return rotmat_to_rot6d(rotmat)
+
+    def forward(
+        self,
+        query_xyz,
+        query_feats,
+        key_xyz,
+        key_feats,
+        obj_center_feat,
+        global_mv_feat,
+        current_rot6d,
+        current_trans_norm,
+        warmup_scale=1.0,
+    ):
+        query_feat, _ = self.query_self_attn(query_xyz, query_feats)
+        query_cat = torch.cat((query_xyz, query_feat), dim=-1)
+        query_feat, _ = self.query_cross_attn(key_xyz, key_feats, query_cat)
+
+        pooled_query_feat = query_feat.mean(dim=1)
+        pose_input = torch.cat(
+            (pooled_query_feat, obj_center_feat, global_mv_feat, current_rot6d, current_trans_norm),
+            dim=-1,
+        )
+        pose_feat = self.pose_context_proj(pose_input)
+        delta_rot = torch.tanh(self.rot_branch(pose_feat)) * (self.obj_pose_rot_delta_abs_max * warmup_scale)
+        delta_trans = torch.tanh(self.trans_branch(pose_feat)) * (self.obj_pose_trans_delta_abs_max * warmup_scale)
+
+        next_rot_seed = self._sanitize_pose_tensor(current_rot6d + delta_rot, 10.0)
+        next_rot6d = self._sanitize_pose_tensor(self._project_delta_rot6d(next_rot_seed), 10.0)
+        next_trans_norm = self._sanitize_pose_tensor(current_trans_norm + delta_trans, 10.0)
+        return query_feat, next_rot6d, next_trans_norm
 
 
 class point_METRO_layer(nn.Module):
@@ -80,6 +163,62 @@ class point_METRO_layer(nn.Module):
         )
 
         return query_feats, query_xyz
+
+    def feed_forward_chunk(self, attention_output):
+        intermediate_output = self.intermediate(attention_output)
+        layer_output = self.output(intermediate_output, attention_output)
+        return layer_output
+
+
+class point_METRO_layer_obj_pose(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.chunk_size_feed_forward = config.chunk_size_feed_forward
+
+        self.attn = BertAttention(config)
+        self.cross_attn = BertAttention(config, position_embedding_type="absolute")
+        self.vec_attn = pointer_layer_obj_pose(config)
+
+        self.intermediate = BertIntermediate(config)
+        self.output = BertOutput(config)
+
+    def forward(
+        self,
+        query_feats,
+        query_xyz,
+        key_feats,
+        key_xyz,
+        obj_center_feat,
+        global_mv_feat,
+        current_rot6d,
+        current_trans_norm,
+        warmup_scale=1.0,
+    ):
+        self_attn_out = self.attn(
+            hidden_states=query_feats, attention_mask=None, output_attentions=False
+        )[0]
+        cross_attn_out = self.cross_attn(
+            hidden_states=self_attn_out,
+            attention_mask=None,
+            encoder_hidden_states=key_feats,
+            output_attentions=False,
+        )[0]
+        query_feats, pred_rot6d, pred_trans_norm = self.vec_attn(
+            query_xyz=query_xyz,
+            query_feats=cross_attn_out,
+            key_xyz=key_xyz,
+            key_feats=key_feats,
+            obj_center_feat=obj_center_feat,
+            global_mv_feat=global_mv_feat,
+            current_rot6d=current_rot6d,
+            current_trans_norm=current_trans_norm,
+            warmup_scale=warmup_scale,
+        )
+        query_feats = apply_chunking_to_forward(
+            self.feed_forward_chunk, self.chunk_size_feed_forward, 1, query_feats
+        )
+        return query_feats, pred_rot6d, pred_trans_norm
 
     def feed_forward_chunk(self, attention_output):
         intermediate_output = self.intermediate(attention_output)
@@ -212,3 +351,67 @@ class point_METRO_block(BertPreTrainedModel):
             )
 
         return pt_updated_hand_xyz, updated_hand_feats, updated_obj_xyz, updated_obj_feats
+
+
+class point_METRO_block_HO_Light(BertPreTrainedModel):
+    """
+        A lightweight one-pass HO block:
+        - object self-attention
+        - hand-object cross-attention
+        - pose regression inside vec_attn with separate rot / trans heads
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.config = config
+        self.obj_pose_layer = point_METRO_layer_obj_pose(config)
+        self.input_dim = config.img_feature_dim
+        self.embedding = nn.Linear(self.input_dim, self.config.hidden_size, bias=True)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.init_weights()
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        elif type(module).__name__ == 'BertLMPredictionHead':
+            module.bias.data.zero_()
+
+    def _embed_inputs(self, hand_feats, obj_feats):
+        hand_feats = self.dropout(self.embedding(hand_feats))
+        obj_feats = self.dropout(self.embedding(obj_feats))
+        return hand_feats, obj_feats
+
+    def forward(
+        self,
+        hand_xyz,
+        hand_feats,
+        obj_xyz,
+        obj_feats,
+        obj_center_feat,
+        global_mv_feat,
+        current_rot6d,
+        current_trans_norm,
+        warmup_scale=1.0,
+    ):
+        hand_feats, obj_feats = self._embed_inputs(hand_feats, obj_feats)
+        updated_obj_feats, pred_rot6d, pred_trans_norm = self.obj_pose_layer(
+            query_feats=obj_feats,
+            query_xyz=obj_xyz,
+            key_feats=hand_feats,
+            key_xyz=hand_xyz,
+            obj_center_feat=obj_center_feat,
+            global_mv_feat=global_mv_feat,
+            current_rot6d=current_rot6d,
+            current_trans_norm=current_trans_norm,
+            warmup_scale=warmup_scale,
+        )
+        return updated_obj_feats, pred_rot6d, pred_trans_norm

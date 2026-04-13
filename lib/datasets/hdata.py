@@ -291,6 +291,7 @@ class HDataset(torch.utils.data.Dataset, ABC):
 
         obj_id = obj_data["obj_id"]
         pc_sparse_rest = obj_data["sparse_rest"]
+        pc_eval_rest = obj_data.get("eval_rest", None)
         pc_sparse_cam = obj_data["sparse_cam"]
         pc_dense_cam = obj_data["dense_cam"]
         R_label = obj_data["R_label"]           # (3, 3) 相机系下的绝对旋转
@@ -351,6 +352,8 @@ class HDataset(torch.utils.data.Dataset, ABC):
             
             if pc_sparse_rest is not None:
                 pc_sparse_rest = self.flip_3d(pc_sparse_rest)
+            if pc_eval_rest is not None:
+                pc_eval_rest = self.flip_3d(pc_eval_rest)
 
             # 翻转 obj_transform
             flip_mat = np.array([[-1, 0, 0, 0],
@@ -378,6 +381,7 @@ class HDataset(torch.utils.data.Dataset, ABC):
             "raw_size": raw_size,
             "obj_id": obj_id,
             "obj_pc_sparse_rest": pc_sparse_rest,
+            "obj_pc_eval_rest": pc_eval_rest,
             "obj_pc_sparse": pc_sparse_cam,       
             "obj_pc_dense": pc_dense_cam,
             "obj_center_3d": obj_center_3d,

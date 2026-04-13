@@ -395,6 +395,8 @@ class SimpleTransform3DMultiView(SimpleTransformUVD):
             
             # 传递不需要被增强改变的标准空间模板
             results["target_obj_pc_sparse_rest"] = label["obj_pc_sparse_rest"]
+            if label.get("obj_pc_eval_rest") is not None:
+                results["target_obj_pc_eval_rest"] = label["obj_pc_eval_rest"]
             results["obj_id"] = label["obj_id"]
 
         if label.get("obj_center_3d") is not None:
