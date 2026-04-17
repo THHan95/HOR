@@ -170,6 +170,211 @@ class ObjectPoseGateHead(nn.Module):
         return torch.nan_to_num(gate, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
 
 
+class SharedMultiViewFusion(nn.Module):
+    def __init__(
+        self,
+        channels,
+        token_dim,
+        canonical_focal=200.0,
+        geo_ratio=0.75,
+        trans_scale_m=0.25,
+        master_logit_boost=0.5,
+        residual_scale=0.5,
+    ):
+        super().__init__()
+        geo_channels = max(int(channels * geo_ratio), 3)
+        geo_channels = min(geo_channels, max(channels - 16, 3))
+        geo_channels = max((geo_channels // 3) * 3, 3)
+        if geo_channels >= channels:
+            geo_channels = max(((channels - 16) // 3) * 3, 3)
+        self.channels = channels
+        self.geo_channels = min(geo_channels, channels)
+        self.app_channels = channels - self.geo_channels
+        self.canonical_focal = float(canonical_focal)
+        self.trans_scale_m = max(float(trans_scale_m), 1e-6)
+        self.master_logit_boost = float(master_logit_boost)
+        self.residual_scale = float(residual_scale)
+
+        self.geo_proj = nn.Sequential(
+            nn.Conv2d(channels, self.geo_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(self.geo_channels),
+            nn.GELU(),
+        )
+        self.app_proj = None
+        if self.app_channels > 0:
+            self.app_proj = nn.Sequential(
+                nn.Conv2d(channels, self.app_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(self.app_channels),
+                nn.GELU(),
+            )
+
+        self.trans_embed = nn.Sequential(
+            nn.Linear(3, self.geo_channels),
+            nn.GELU(),
+            nn.Linear(self.geo_channels, self.geo_channels),
+        )
+        self.view_weight_head = nn.Sequential(
+            nn.Linear(token_dim + 6, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, 1),
+        )
+        self.master_refine = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+            ResidualAttentionBlock(channels),
+        )
+        self.view_gate = nn.Sequential(
+            nn.Linear(token_dim + 2, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+            nn.Sigmoid(),
+        )
+        self.view_refine = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+            ResidualAttentionBlock(channels),
+        )
+
+    @staticmethod
+    def _gather_by_master(tensor, master_id):
+        batch_size = tensor.shape[0]
+        batch_idx = torch.arange(batch_size, device=tensor.device)
+        return tensor[batch_idx, master_id]
+
+    @staticmethod
+    def _build_diag(v0, v1, device, dtype):
+        batch_size, num_views = v0.shape
+        diag = torch.zeros(batch_size, num_views, 3, 3, device=device, dtype=dtype)
+        diag[..., 0, 0] = v0
+        diag[..., 1, 1] = v1
+        diag[..., 2, 2] = 1.0
+        return diag
+
+    @staticmethod
+    def _rotation_angle(rotmat):
+        trace = rotmat[..., 0, 0] + rotmat[..., 1, 1] + rotmat[..., 2, 2]
+        cos_theta = torch.clamp((trace - 1.0) * 0.5, min=-1.0 + 1e-6, max=1.0 - 1e-6)
+        return torch.acos(cos_theta)
+
+    def _build_feature_transforms(self, cam_intr, cam_extr, master_id):
+        batch_size, num_views = cam_intr.shape[:2]
+        device = cam_intr.device
+        dtype = cam_intr.dtype
+        batch_idx = torch.arange(batch_size, device=device)
+
+        master_extr = cam_extr[batch_idx, master_id]
+        master_intr = cam_intr[batch_idx, master_id]
+        view_to_master = torch.matmul(torch.linalg.inv(master_extr).unsqueeze(1), cam_extr)
+        master_to_view = torch.linalg.inv(view_to_master)
+
+        fx = cam_intr[..., 0, 0].clamp_min(1e-6)
+        fy = cam_intr[..., 1, 1].clamp_min(1e-6)
+        master_fx = master_intr[:, 0, 0].unsqueeze(1).clamp_min(1e-6)
+        master_fy = master_intr[:, 1, 1].unsqueeze(1).clamp_min(1e-6)
+
+        sv_scale = self._build_diag(
+            self.canonical_focal / fx,
+            self.canonical_focal / fy,
+            device=device,
+            dtype=dtype,
+        )
+        master_scale_inv = self._build_diag(
+            master_fx / self.canonical_focal,
+            master_fy / self.canonical_focal,
+            device=device,
+            dtype=dtype,
+        )
+        rot_view_to_master = view_to_master[..., :3, :3]
+        xf_view_to_master = torch.matmul(master_scale_inv, torch.matmul(rot_view_to_master, sv_scale))
+        xf_master_to_view = torch.linalg.inv(xf_view_to_master)
+
+        trans_view_to_master = view_to_master[..., :3, 3]
+        trans_master_to_view = master_to_view[..., :3, 3]
+        geom_stats = torch.stack(
+            (
+                torch.log(fx / master_fx),
+                torch.log(fy / master_fy),
+                trans_view_to_master[..., 0] / self.trans_scale_m,
+                trans_view_to_master[..., 1] / self.trans_scale_m,
+                trans_view_to_master[..., 2] / self.trans_scale_m,
+                self._rotation_angle(rot_view_to_master) / math.pi,
+            ),
+            dim=-1,
+        )
+        return xf_view_to_master, xf_master_to_view, trans_view_to_master, trans_master_to_view, geom_stats
+
+    def _apply_geo_transform(self, geo_feat, xf, trans_bias):
+        batch_size, num_views, _, height, width = geo_feat.shape
+        geo_groups = self.geo_channels // 3
+        geo_feat = geo_feat.view(batch_size, num_views, geo_groups, 3, height, width).permute(0, 1, 2, 4, 5, 3)
+        geo_feat = torch.einsum("bvij,bvghwj->bvghwi", xf, geo_feat)
+        geo_feat = geo_feat.permute(0, 1, 2, 5, 3, 4).reshape(batch_size, num_views, self.geo_channels, height, width)
+        return geo_feat + trans_bias.view(batch_size, num_views, self.geo_channels, 1, 1)
+
+    def forward(self, feat, token_views, cam_intr, cam_extr, master_id):
+        batch_size, num_views, channels, height, width = feat.shape
+        flat_feat = feat.flatten(0, 1)
+        geo_feat = self.geo_proj(flat_feat).view(batch_size, num_views, self.geo_channels, height, width)
+        app_feat = None
+        if self.app_proj is not None:
+            app_feat = self.app_proj(flat_feat).view(batch_size, num_views, self.app_channels, height, width)
+
+        xf_view_to_master, xf_master_to_view, trans_view_to_master, trans_master_to_view, geom_stats = self._build_feature_transforms(
+            cam_intr,
+            cam_extr,
+            master_id,
+        )
+        trans_bias_master = self.trans_embed(trans_view_to_master / self.trans_scale_m)
+        geo_feat_master = self._apply_geo_transform(geo_feat, xf_view_to_master, trans_bias_master)
+
+        view_logits = self.view_weight_head(torch.cat((token_views, geom_stats), dim=-1)).squeeze(-1)
+        master_mask = torch.zeros(batch_size, num_views, device=feat.device, dtype=feat.dtype)
+        master_mask.scatter_(1, master_id.unsqueeze(-1), 1.0)
+        view_logits = view_logits + master_mask * self.master_logit_boost
+        view_weights = torch.softmax(view_logits, dim=1)
+
+        weight_map = view_weights.view(batch_size, num_views, 1, 1, 1)
+        fused_geo_master = torch.sum(geo_feat_master * weight_map, dim=1)
+        if app_feat is None:
+            fused_master = fused_geo_master
+        else:
+            fused_app_master = torch.sum(app_feat * weight_map, dim=1)
+            fused_master = torch.cat((fused_geo_master, fused_app_master), dim=1)
+
+        master_anchor = self._gather_by_master(feat, master_id)
+        fused_master = self.master_refine(torch.cat((fused_master, master_anchor), dim=1))
+
+        fused_geo_master = fused_master[:, :self.geo_channels]
+        fused_geo_views = fused_geo_master.unsqueeze(1).expand(-1, num_views, -1, -1, -1)
+        trans_bias_view = self.trans_embed(trans_master_to_view / self.trans_scale_m)
+        fused_geo_views = self._apply_geo_transform(fused_geo_views, xf_master_to_view, trans_bias_view)
+
+        if self.app_channels > 0:
+            fused_app_master = fused_master[:, self.geo_channels:]
+            fused_app_views = fused_app_master.unsqueeze(1).expand(-1, num_views, -1, -1, -1)
+            fused_views = torch.cat((fused_geo_views, fused_app_views), dim=2)
+        else:
+            fused_views = fused_geo_views
+
+        gate_input = torch.cat((token_views, view_weights.unsqueeze(-1), master_mask.unsqueeze(-1)), dim=-1)
+        view_gate = self.view_gate(gate_input).view(batch_size, num_views, channels, 1, 1)
+        fused_views = fused_views * view_gate
+        refined_views = self.view_refine(torch.cat((feat.flatten(0, 1), fused_views.flatten(0, 1)), dim=1))
+        refined_views = feat + self.residual_scale * refined_views.view(batch_size, num_views, channels, height, width)
+        refined_views = torch.nan_to_num(refined_views, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        aux = {
+            "view_weights": view_weights,
+            "view_gate": view_gate.squeeze(-1).squeeze(-1),
+            "master_mask": master_mask,
+            "geom_stats": geom_stats,
+            "fused_master": fused_master,
+        }
+        return refined_views, aux
+
+
 @MODEL.register_module()
 class POEM_SV_Tri(nn.Module, ModuleAbstract):
     def __init__(self, cfg):
@@ -217,6 +422,12 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
         self.obj_pose_loss_trans_tau_m = float(cfg.get("OBJ_POSE_LOSS_TRANS_TAU_M", self.obj_pose_gate_trans_tau_m))
         self.num_obj_classes = int(cfg.get("NUM_OBJ_CLASSES", 32))
         self.obj_id_embed_dim = int(cfg.get("OBJ_ID_EMBED_DIM", 32))
+        self.shared_mv_fusion_enabled = bool(cfg.get("SHARED_MV_FUSION_ENABLED", cfg.get("OBJ_MV_FUSION_ENABLED", True)))
+        self.shared_mv_canonical_focal = float(cfg.get("SHARED_MV_CANONICAL_FOCAL", cfg.get("OBJ_MV_CANONICAL_FOCAL", 200.0)))
+        self.shared_mv_geo_ratio = float(cfg.get("SHARED_MV_GEO_RATIO", cfg.get("OBJ_MV_GEO_RATIO", 0.75)))
+        self.shared_mv_trans_scale_m = float(cfg.get("SHARED_MV_TRANS_SCALE_M", cfg.get("OBJ_MV_TRANS_SCALE_M", 0.25)))
+        self.shared_mv_master_logit_boost = float(cfg.get("SHARED_MV_MASTER_LOGIT_BOOST", cfg.get("OBJ_MV_MASTER_LOGIT_BOOST", 0.5)))
+        self.shared_mv_residual_scale = float(cfg.get("SHARED_MV_RESIDUAL_SCALE", cfg.get("OBJ_MV_RESIDUAL_SCALE", 0.5)))
 
         self.current_stage_name = "sv"
         self.current_val_recon_mode = "sv"
@@ -257,6 +468,16 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
             nn.GELU(),
             nn.Linear(self.shared_dim * 2, self.shared_dim * 2),
         )
+        self.shared_pool = AttentionPool2d(self.shared_dim, out_dim=self.obj_token_dim)
+        self.shared_mv_fusion = SharedMultiViewFusion(
+            channels=self.shared_dim,
+            token_dim=self.obj_token_dim,
+            canonical_focal=self.shared_mv_canonical_focal,
+            geo_ratio=self.shared_mv_geo_ratio,
+            trans_scale_m=self.shared_mv_trans_scale_m,
+            master_logit_boost=self.shared_mv_master_logit_boost,
+            residual_scale=self.shared_mv_residual_scale,
+        ) if self.shared_mv_fusion_enabled else None
 
         self.hand_pool = nn.AdaptiveAvgPool2d(1)
         self.obj_pool = AttentionPool2d(self.shared_dim, out_dim=self.obj_token_dim)
@@ -488,6 +709,17 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
             obj_id = obj_id[..., 0]
         obj_id = obj_id.clamp_(min=0, max=max(self.num_obj_classes - 1, 0))
         return obj_id
+
+    def _extract_master_id(self, batch, batch_size, device):
+        master_id = batch.get("master_id", None)
+        if master_id is None:
+            return torch.zeros(batch_size, device=device, dtype=torch.long)
+        if not torch.is_tensor(master_id):
+            master_id = torch.as_tensor(master_id, device=device)
+        master_id = master_id.to(device=device, dtype=torch.long)
+        while master_id.dim() > 1:
+            master_id = master_id[..., 0]
+        return master_id.clamp_(min=0)
 
     def _apply_object_identity_conditioning(self, obj_feat, batch, batch_size, num_views):
         obj_id = self._extract_object_id(batch, obj_feat.device)
@@ -749,6 +981,26 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
         bn = mlvl_feat.shape[0]
 
         shared_feat = self.shared_stem(mlvl_feat)
+        master_id = self._extract_master_id(batch, batch_size, shared_feat.device).clamp(max=max(num_cams - 1, 0))
+        obj_mv_view_weights = shared_feat.new_full((batch_size, num_cams), 1.0 / max(num_cams, 1))
+        obj_mv_view_gate = shared_feat.new_ones(batch_size, num_cams, self.shared_dim)
+        obj_mv_master_weight = shared_feat.new_zeros(batch_size)
+        if self.shared_mv_fusion is not None and num_cams > 1:
+            shared_feat_mv = shared_feat.view(batch_size, num_cams, self.shared_dim, shared_feat.shape[-2], shared_feat.shape[-1])
+            shared_token_seed, _ = self.shared_pool(shared_feat)
+            shared_token_views = shared_token_seed.view(batch_size, num_cams, -1)
+            shared_feat_mv, shared_mv_aux = self.shared_mv_fusion(
+                shared_feat_mv,
+                shared_token_views,
+                batch["target_cam_intr"].to(device=shared_feat.device, dtype=shared_feat.dtype),
+                batch["target_cam_extr"].to(device=shared_feat.device, dtype=shared_feat.dtype),
+                master_id,
+            )
+            shared_feat = shared_feat_mv.flatten(0, 1)
+            obj_mv_view_weights = shared_mv_aux["view_weights"]
+            obj_mv_view_gate = shared_mv_aux["view_gate"]
+            batch_idx = torch.arange(batch_size, device=shared_feat.device)
+            obj_mv_master_weight = obj_mv_view_weights[batch_idx, master_id]
         hand_feat = self.hand_adapter(shared_feat)
         obj_feat = self.obj_adapter(shared_feat)
 
@@ -892,6 +1144,9 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
             "obj_pose_gate_rot_err": obj_pose_gate_rot_err,
             "obj_pose_gate_trans_err": obj_pose_gate_trans_err,
             "obj_tri_kp_master": obj_kp3d_tri_master,
+            "obj_mv_view_weights": obj_mv_view_weights,
+            "obj_mv_view_gate": obj_mv_view_gate,
+            "obj_mv_master_weight": obj_mv_master_weight,
             "obj_points_cam": pred_obj_points_abs_sv,
             "pred_hand_pixel_views": pred_hand_jts_pixel_views,
             "tri_hand_joints_master": tri_hand_master,
@@ -1087,6 +1342,17 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
             "metric_obj_tri_px": obj_tri_err.mean() if obj_tri_err is not None else zero,
         }
 
+    def compute_object_mv_fusion_metrics(self, preds):
+        zero = preds["mano_3d_mesh_sv"].new_tensor(0.0)
+        view_weights = preds.get("obj_mv_view_weights", None)
+        view_gate = preds.get("obj_mv_view_gate", None)
+        master_weight = preds.get("obj_mv_master_weight", None)
+        return {
+            "metric_obj_mv_w": view_weights.max(dim=1).values.mean() if torch.is_tensor(view_weights) else zero,
+            "metric_obj_mv_gate": view_gate.mean() if torch.is_tensor(view_gate) else zero,
+            "metric_obj_mv_master_w": master_weight.mean() if torch.is_tensor(master_weight) else zero,
+        }
+
     def _update_sv_metrics(self, preds, batch, use_pa=False):
         pred_mano_3d_mesh_sv = preds["mano_3d_mesh_sv"]
         pred_mano_3d_joints_sv = pred_mano_3d_mesh_sv[:, self.num_hand_verts:]
@@ -1117,6 +1383,7 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
             **self.compute_sv_object_metrics(preds, batch),
             **self.compute_triangulation_confidence_metrics(preds),
             **self.compute_object_gate_metrics(preds),
+            **self.compute_object_mv_fusion_metrics(preds),
         }
         self.loss_metric.feed({**loss_dict, **metric_dict}, batch_size=batch["image"].size(0))
         self._update_sv_metrics(preds, batch, use_pa=False)
@@ -1159,6 +1426,7 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
             **self.compute_sv_object_metrics(preds, batch),
             **self.compute_triangulation_confidence_metrics(preds),
             **self.compute_object_gate_metrics(preds),
+            **self.compute_object_mv_fusion_metrics(preds),
         }
         self.loss_metric.feed({**loss_dict, **metric_dict}, batch_size=batch["image"].size(0))
         self._update_sv_metrics(preds, batch, use_pa=True)
@@ -1373,6 +1641,7 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
                 f"H {_get_loss('loss_2d_sv'):.3f}/{_get_loss('loss_pose_reg_sv'):.3f}/{_get_loss('loss_shape_reg_sv'):.3f} | "
                 f"O {_get_loss('loss_obj_2d'):.3f}/{_get_loss('loss_obj_conf'):.3f}/{_get_loss('loss_obj_tri_reproj'):.3f}/{_get_loss('loss_obj_pose_gate'):.3f}/{_get_loss('metric_obj_pnp_valid'):.2f} | "
                 f"G {_get_loss('metric_obj_vis_conf'):.3f}/{_get_loss('metric_obj_tri_conf'):.3f}/{_get_loss('metric_obj_pose_gate'):.3f} | "
+                f"M {_get_loss('metric_obj_mv_w'):.3f}/{_get_loss('metric_obj_mv_gate'):.3f}/{_get_loss('metric_obj_mv_master_w'):.3f} | "
                 f"Tri {_get_loss('metric_tri_hand_conf'):.3f}/{_get_loss('metric_tri_hand_px'):.1f}px | "
                 f"KP {_fmt_mm_pair(self.MPJPE_SV_3D.get_result(), self.MPVPE_SV_3D.get_result())} | "
                 f"Obj {_get_loss('metric_sv_obj_rot_deg'):.1f}/{_fmt_mm_value(_get_loss('metric_sv_obj_trans_epe'))} | "
@@ -1386,6 +1655,7 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
             f"Tri {_get_loss('metric_tri_hand_conf'):.3f}/{_get_loss('metric_tri_hand_px'):.1f}px | "
             f"PnP {_get_loss('metric_obj_pnp_valid'):.2f} | "
             f"G {_get_loss('metric_obj_vis_conf'):.3f}/{_get_loss('metric_obj_tri_conf'):.3f}/{_get_loss('metric_obj_pose_gate'):.3f} | "
+            f"M {_get_loss('metric_obj_mv_w'):.3f}/{_get_loss('metric_obj_mv_gate'):.3f}/{_get_loss('metric_obj_mv_master_w'):.3f} | "
             f"Obj A/S {_fmt_mm_pair(_get_loss('metric_sv_obj_add'), _get_loss('metric_sv_obj_adds'))} | "
             f"Rot/Tr {_get_loss('metric_sv_obj_rot_deg'):.1f}/{_fmt_mm_value(_get_loss('metric_sv_obj_trans_epe'))} | "
             f"Rec {_fmt_obj_recon(self.OBJ_RECON_SV)}"
