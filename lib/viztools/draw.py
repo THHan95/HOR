@@ -24,6 +24,8 @@ def draw_batch_mesh_images_pred(
     tensor_image,
     pred_obj_conf=None,
     pred_obj_error=None,
+    pred_obj_rot_error=None,
+    pred_obj_trans_error=None,
     n_sample=16,
 ):
     batch_size = gt_verts2d.shape[0]
@@ -38,22 +40,43 @@ def draw_batch_mesh_images_pred(
     pred_verts2d = pred_verts2d[:n_sample, ...].detach().cpu().numpy()  # (B, NV, 2)
     gt_obj2d = gt_obj2d[:n_sample, ...].detach().cpu().numpy()  # (B, N_obj, 2)
     pred_obj2d = pred_obj2d[:n_sample, ...].detach().cpu().numpy()  # (B, N_obj, 2)
-    gt_objc2d = gt_objc2d[:n_sample, ...].detach().cpu().numpy()  # (B, 1, 2)
-    pred_objc2d = pred_objc2d[:n_sample, ...].detach().cpu().numpy()  # (B, 1, 2)
+    if gt_objc2d is not None:
+        gt_objc2d = gt_objc2d[:n_sample, ...].detach().cpu().numpy()  # (B, 1, 2)
+    if pred_objc2d is not None:
+        pred_objc2d = pred_objc2d[:n_sample, ...].detach().cpu().numpy()  # (B, 1, 2)
     intr = intr[:n_sample, ...].detach().cpu().numpy()  # (B, 3, 3)
     if pred_obj_conf is not None:
         pred_obj_conf = _tensor_to_safe_numpy(pred_obj_conf, n_sample=n_sample, nan_value=0.0)
     if pred_obj_error is not None:
         pred_obj_error = _tensor_to_safe_numpy(pred_obj_error, n_sample=n_sample, nan_value=0.0)
+    if pred_obj_rot_error is not None:
+        pred_obj_rot_error = _tensor_to_safe_numpy(pred_obj_rot_error, n_sample=n_sample, nan_value=0.0)
+    if pred_obj_trans_error is not None:
+        pred_obj_trans_error = _tensor_to_safe_numpy(pred_obj_trans_error, n_sample=n_sample, nan_value=0.0)
+
+    def _broadcast_first_dim(value):
+        if value is None:
+            return None
+        if value.shape[0] == 1 and n_sample > 1:
+            repeat_shape = [n_sample] + [1] * (value.ndim - 1)
+            value = np.tile(value, repeat_shape)
+        return value
+
+    gt_objc2d = _broadcast_first_dim(gt_objc2d)
+    pred_objc2d = _broadcast_first_dim(pred_objc2d)
+    pred_obj_conf = _broadcast_first_dim(pred_obj_conf)
+    pred_obj_error = _broadcast_first_dim(pred_obj_error)
+    pred_obj_rot_error = _broadcast_first_dim(pred_obj_rot_error)
+    pred_obj_trans_error = _broadcast_first_dim(pred_obj_trans_error)
 
     sample_list = []
     for i in range(n_sample):
         gt_verts2d_i = gt_verts2d[i].copy()
         gt_obj2d_i = gt_obj2d[i].copy()
-        gt_objc2d_i = gt_objc2d[i].copy()
+        gt_objc2d_i = None if gt_objc2d is None else gt_objc2d[i].copy()
         pred_verts2d_i = pred_verts2d[i].copy()
         pred_obj2d_i = pred_obj2d[i].copy()
-        pred_objc2d_i = pred_objc2d[i].copy()
+        pred_objc2d_i = None if pred_objc2d is None else pred_objc2d[i].copy()
 
         intr_i = intr[i].copy()
 
@@ -75,11 +98,35 @@ def draw_batch_mesh_images_pred(
             err_value = float(pred_obj_error[i].reshape(-1)[0])
             cv2.putText(
                 pred_mesh_img,
+                f"obj err {err_value:.1f}",
+                (10, 44),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (220, 90, 30),
+                1,
+                cv2.LINE_AA,
+            )
+        if pred_obj_rot_error is not None:
+            err_value = float(pred_obj_rot_error[i].reshape(-1)[0])
+            cv2.putText(
+                pred_mesh_img,
                 f"rot err {err_value:.1f} deg",
                 (10, 44),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 (220, 90, 30),
+                1,
+                cv2.LINE_AA,
+            )
+        if pred_obj_trans_error is not None:
+            err_value = float(pred_obj_trans_error[i].reshape(-1)[0])
+            cv2.putText(
+                pred_mesh_img,
+                f"tr err {err_value:.1f} mm",
+                (10, 66),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (30, 140, 220),
                 1,
                 cv2.LINE_AA,
             )
@@ -271,6 +318,146 @@ def draw_batch_joint_images(joints2d, gt_jointd2d, tensor_image, step_idx, n_sam
     # draw finished
     sample_array = np.concatenate(sample_list, axis=0)  # (B, H, W, C)
     return sample_array
+
+
+def draw_batch_object_kp_images(obj_kp2d, tensor_image, n_sample=16, draw_index=True, title="Object KP21"):
+    batch_size = obj_kp2d.shape[0]
+    if n_sample >= batch_size:
+        n_sample = batch_size
+
+    tensor_image = tensor_image[:n_sample, ...].detach().cpu()
+    image = bchw_2_bhwc(denormalize(tensor_image, [0.5, 0.5, 0.5], [1, 1, 1], inplace=False))
+    image = image.mul_(255.0).numpy().astype(np.uint8)
+
+    obj_kp2d = _tensor_to_safe_numpy(obj_kp2d, n_sample=n_sample, nan_value=-1.0)
+
+    sample_list = []
+    num_points = obj_kp2d.shape[1] if obj_kp2d.ndim >= 3 else 0
+    color_map = cv2.COLORMAP_TURBO if hasattr(cv2, "COLORMAP_TURBO") else cv2.COLORMAP_JET
+    denom = max(num_points - 1, 1)
+
+    for i in range(n_sample):
+        overlay = image[i].copy()
+        cv2.putText(
+            overlay,
+            title,
+            (10, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            overlay,
+            title,
+            (10, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (20, 20, 20),
+            1,
+            cv2.LINE_AA,
+        )
+
+        for kp_idx, coord in enumerate(obj_kp2d[i]):
+            if not np.isfinite(coord).all():
+                continue
+            x, y = np.round(coord[:2]).astype(np.int32)
+            color_val = np.uint8(round(255.0 * (kp_idx / denom)))
+            color = cv2.applyColorMap(np.array([[color_val]], dtype=np.uint8), color_map)[0, 0]
+            color = tuple(int(c) for c in color)
+            cv2.circle(overlay, (int(x), int(y)), radius=4, color=color, thickness=-1, lineType=cv2.LINE_AA)
+            cv2.circle(overlay, (int(x), int(y)), radius=6, color=(255, 255, 255), thickness=1, lineType=cv2.LINE_AA)
+            if draw_index:
+                cv2.putText(
+                    overlay,
+                    str(kp_idx),
+                    (int(x) + 4, int(y) - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        sample = cv2.copyMakeBorder(overlay, 5, 5, 5, 5, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        sample_list.append(sample[None, ...])
+
+    return np.concatenate(sample_list, axis=0)
+
+
+def draw_batch_object_kp_confidence_images(obj_kp2d, obj_conf, tensor_image, n_sample=16, draw_index=True, title="Object KP21 Confidence"):
+    batch_size = obj_kp2d.shape[0]
+    if n_sample >= batch_size:
+        n_sample = batch_size
+
+    tensor_image = tensor_image[:n_sample, ...].detach().cpu()
+    image = bchw_2_bhwc(denormalize(tensor_image, [0.5, 0.5, 0.5], [1, 1, 1], inplace=False))
+    image = image.mul_(255.0).numpy().astype(np.uint8)
+
+    obj_kp2d = _tensor_to_safe_numpy(obj_kp2d, n_sample=n_sample, nan_value=-1.0)
+    obj_conf = _tensor_to_safe_numpy(obj_conf, n_sample=n_sample, nan_value=0.0)
+
+    sample_list = []
+    panel_w = 180
+    num_points = obj_kp2d.shape[1] if obj_kp2d.ndim >= 3 else 0
+    color_map = cv2.COLORMAP_TURBO if hasattr(cv2, "COLORMAP_TURBO") else cv2.COLORMAP_JET
+    denom = max(num_points - 1, 1)
+
+    for i in range(n_sample):
+        overlay = image[i].copy()
+        conf_i = obj_conf[i].reshape(-1)
+        conf_scale = _finite_max(conf_i, default=1.0)
+
+        cv2.putText(overlay, title, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(overlay, title, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (24, 24, 24), 1, cv2.LINE_AA)
+
+        for kp_idx, coord in enumerate(obj_kp2d[i]):
+            if not np.isfinite(coord).all():
+                continue
+            x, y = np.round(coord[:2]).astype(np.int32)
+            conf_norm = _safe_prob(conf_i[kp_idx] / conf_scale)
+            color_val = np.uint8(round(255.0 * (kp_idx / denom)))
+            base_color = cv2.applyColorMap(np.array([[color_val]], dtype=np.uint8), color_map)[0, 0]
+            base_color = tuple(int(c) for c in base_color)
+            conf_color = tuple(int(c) for c in _confidence_to_bgr(conf_norm))
+            radius = int(3 + round(conf_norm * 5))
+            cv2.circle(overlay, (int(x), int(y)), radius=radius + 2, color=base_color, thickness=1, lineType=cv2.LINE_AA)
+            cv2.circle(overlay, (int(x), int(y)), radius=radius, color=conf_color, thickness=-1, lineType=cv2.LINE_AA)
+            cv2.circle(overlay, (int(x), int(y)), radius=max(1, radius // 2), color=(255, 255, 255), thickness=-1, lineType=cv2.LINE_AA)
+            if draw_index:
+                cv2.putText(
+                    overlay,
+                    f"{kp_idx}:{conf_i[kp_idx]:.2f}",
+                    (int(x) + 4, int(y) - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.3,
+                    conf_color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        panel = np.full((overlay.shape[0], panel_w, 3), 255, dtype=np.uint8)
+        cv2.putText(panel, "Obj KP Confidence", (10, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (32, 32, 32), 1, cv2.LINE_AA)
+        cv2.putText(panel, f"max={conf_scale:.4f}", (10, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (96, 96, 96), 1, cv2.LINE_AA)
+
+        row_h = max(9, (panel.shape[0] - 48) // max(num_points, 1))
+        bar_x0 = 42
+        bar_x1 = panel_w - 12
+        for kp_idx in range(num_points):
+            conf_norm = _safe_prob(conf_i[kp_idx] / conf_scale)
+            color = _confidence_to_bgr(conf_norm)
+            y = 48 + kp_idx * row_h
+            cv2.putText(panel, f"{kp_idx:02d}", (6, y + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (48, 48, 48), 1, cv2.LINE_AA)
+            cv2.rectangle(panel, (bar_x0, y), (bar_x1, y + 6), (230, 230, 230), thickness=-1)
+            fill_x = bar_x0 + int(round((bar_x1 - bar_x0) * np.clip(conf_norm, 0.0, 1.0)))
+            cv2.rectangle(panel, (bar_x0, y), (fill_x, y + 6), tuple(int(c) for c in color), thickness=-1)
+
+        sample = np.hstack([overlay, panel])
+        sample = cv2.copyMakeBorder(sample, 5, 5, 5, 5, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        sample_list.append(sample[None, ...])
+
+    return np.concatenate(sample_list, axis=0)
 
 
 def _confidence_to_bgr(conf_value):

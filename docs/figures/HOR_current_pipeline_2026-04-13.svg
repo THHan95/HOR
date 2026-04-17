@@ -1,0 +1,127 @@
+<svg width="1600" height="900" viewBox="0 0 1600 900" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .title { font: 700 34px 'Arial','PingFang SC','Microsoft YaHei',sans-serif; fill: #1f2937; }
+      .subtitle { font: 500 18px 'Arial','PingFang SC','Microsoft YaHei',sans-serif; fill: #475569; }
+      .label { font: 600 20px 'Arial','PingFang SC','Microsoft YaHei',sans-serif; fill: #0f172a; }
+      .small { font: 500 16px 'Arial','PingFang SC','Microsoft YaHei',sans-serif; fill: #334155; }
+      .tiny { font: 500 14px 'Arial','PingFang SC','Microsoft YaHei',sans-serif; fill: #475569; }
+      .box { stroke: #334155; stroke-width: 2.2; rx: 18; ry: 18; }
+      .arrow { stroke: #475569; stroke-width: 3; fill: none; marker-end: url(#arrowHead); }
+      .dash { stroke-dasharray: 8 6; }
+    </style>
+    <marker id="arrowHead" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1600" height="900" fill="#f8fafc"/>
+  <text x="54" y="58" class="title">当前 HOR 方法简易流程图</text>
+  <text x="54" y="92" class="subtitle">多视角输入 + 单视角手物先验 + Stage2 轻量化 HO 交互 + 模板点云刚性恢复</text>
+
+  <!-- Stage tags -->
+  <rect x="48" y="130" width="180" height="40" fill="#dbeafe" stroke="#93c5fd" rx="12" ry="12"/>
+  <text x="78" y="157" class="label" style="font-size:18px;">Stage1: Hand + SV Pose</text>
+  <rect x="860" y="130" width="180" height="40" fill="#dcfce7" stroke="#86efac" rx="12" ry="12"/>
+  <text x="892" y="157" class="label" style="font-size:18px;">Stage2: HO-Pose</text>
+
+  <!-- Input -->
+  <rect class="box" x="60" y="220" width="170" height="88" fill="#e0f2fe"/>
+  <text x="100" y="255" class="label">8 视角 RGB</text>
+  <text x="101" y="283" class="small">裁剪手物图像</text>
+
+  <rect class="box" x="280" y="220" width="210" height="88" fill="#e2e8f0"/>
+  <text x="335" y="255" class="label">ResNet34 Backbone</text>
+  <text x="317" y="283" class="small">global feat + multi-level feat</text>
+
+  <!-- Branch 1 -->
+  <rect class="box" x="540" y="180" width="210" height="80" fill="#fde68a"/>
+  <text x="592" y="214" class="label">Heatmap / Occ</text>
+  <text x="577" y="242" class="small">32x32 hand / obj heatmap</text>
+
+  <rect class="box" x="540" y="286" width="210" height="90" fill="#fef3c7"/>
+  <text x="588" y="322" class="label">HOT + MANO</text>
+  <text x="559" y="350" class="small">单视角 hand mesh / joints</text>
+
+  <rect class="box" x="800" y="176" width="240" height="94" fill="#fee2e2"/>
+  <text x="838" y="212" class="label">SV Object Pose Head</text>
+  <text x="832" y="240" class="small">global_feat + hand_obj_fused</text>
+  <text x="848" y="262" class="tiny">输出 per-view rot6d / trans</text>
+
+  <rect class="box" x="800" y="308" width="240" height="86" fill="#ede9fe"/>
+  <text x="830" y="344" class="label">多视角投影 / 三角化</text>
+  <text x="842" y="372" class="small">ref hand / 粗几何初始化</text>
+
+  <!-- Branch 2 -->
+  <rect class="box" x="540" y="420" width="210" height="80" fill="#c7f9cc"/>
+  <text x="586" y="455" class="label">Feature Decode</text>
+  <text x="573" y="483" class="small">得到 128D 多尺度特征图</text>
+
+  <rect class="box" x="805" y="438" width="230" height="86" fill="#d1fae5"/>
+  <text x="830" y="474" class="label">Master Hand Mesh</text>
+  <text x="831" y="502" class="small">hand-only branch 先学稳手</text>
+
+  <rect class="box" x="1100" y="180" width="210" height="84" fill="#fecaca"/>
+  <text x="1131" y="214" class="label">SV Init Pose</text>
+  <text x="1126" y="242" class="small">取主视角 rot / trans</text>
+
+  <rect class="box" x="1100" y="304" width="210" height="84" fill="#ddd6fe"/>
+  <text x="1128" y="338" class="label">模板点云初始化</text>
+  <text x="1148" y="366" class="small">2048 object points</text>
+
+  <rect class="box" x="1100" y="430" width="210" height="94" fill="#dcfce7"/>
+  <text x="1137" y="464" class="label">多视角点特征采样</text>
+  <text x="1128" y="492" class="small">object 点投影到各视角取特征</text>
+
+  <rect class="box" x="1360" y="300" width="190" height="160" fill="#bbf7d0"/>
+  <text x="1405" y="336" class="label">HO-Light</text>
+  <text x="1390" y="366" class="small">1 次 obj self-attn</text>
+  <text x="1375" y="394" class="small">1 次 hand-object cross-attn</text>
+  <text x="1392" y="422" class="small">rot / trans 分支回归</text>
+
+  <rect class="box" x="1360" y="510" width="190" height="92" fill="#86efac"/>
+  <text x="1382" y="546" class="label">Master Obj Pose</text>
+  <text x="1380" y="574" class="small">master rot6d / trans</text>
+
+  <rect class="box" x="1330" y="646" width="250" height="102" fill="#cffafe"/>
+  <text x="1374" y="684" class="label">Object Reconstruction</text>
+  <text x="1365" y="712" class="small">变换模板点云 -> SV / Master ObjRec</text>
+  <text x="1403" y="734" class="tiny">CD / FS@5 / FS@10</text>
+
+  <!-- Loss block -->
+  <rect class="box" x="60" y="650" width="1120" height="120" fill="#f1f5f9"/>
+  <text x="88" y="690" class="label">主要监督</text>
+  <text x="90" y="720" class="small">1. 手部分支：2D / heatmap / triangulation / MANO consistency</text>
+  <text x="520" y="720" class="small">2. SV 物体：per-view camera-frame rot6d / trans</text>
+  <text x="90" y="748" class="small">3. Master 物体：master-frame rot6d / trans + 2048 点点云损失</text>
+  <text x="520" y="748" class="small">4. 后期可选：master -> SV 自蒸馏</text>
+
+  <!-- Arrows -->
+  <path class="arrow" d="M230 264 L280 264"/>
+  <path class="arrow" d="M490 250 L540 220"/>
+  <path class="arrow" d="M490 276 L540 328"/>
+  <path class="arrow" d="M490 290 L540 460"/>
+
+  <path class="arrow" d="M750 220 L800 220"/>
+  <path class="arrow" d="M750 332 L800 332"/>
+  <path class="arrow" d="M750 460 L805 480"/>
+
+  <path class="arrow" d="M750 332 L1100 332"/>
+  <path class="arrow" d="M1040 220 L1100 222"/>
+  <path class="arrow" d="M1040 352 L1100 346"/>
+  <path class="arrow" d="M1205 264 L1205 304"/>
+  <path class="arrow" d="M1205 388 L1205 430"/>
+
+  <path class="arrow" d="M1035 480 L1360 380"/>
+  <path class="arrow" d="M1310 346 L1360 346"/>
+  <path class="arrow" d="M1310 480 L1360 415"/>
+  <path class="arrow" d="M1455 460 L1455 510"/>
+  <path class="arrow" d="M1455 602 L1455 646"/>
+
+  <!-- Dashed supervision hints -->
+  <path class="arrow dash" d="M920 394 L920 650"/>
+  <path class="arrow dash" d="M1460 602 L1140 650"/>
+  <path class="arrow dash" d="M645 376 L340 650"/>
+
+  <text x="1115" y="120" class="subtitle">当前方法主特点：模板点云刚性恢复，而非从零生成形状</text>
+</svg>

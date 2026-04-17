@@ -1,0 +1,187 @@
+<svg width="1800" height="1060" viewBox="0 0 1800 1060" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .title { font: 700 34px 'Arial','PingFang SC','Microsoft YaHei',sans-serif; fill: #0f172a; }
+      .subtitle { font: 500 18px 'Arial','PingFang SC','Microsoft YaHei',sans-serif; fill: #475569; }
+      .stage { font: 700 24px 'Arial','PingFang SC','Microsoft YaHei',sans-serif; fill: #0f172a; }
+      .label { font: 700 20px 'Arial','PingFang SC','Microsoft YaHei',sans-serif; fill: #0f172a; }
+      .small { font: 500 16px 'Arial','PingFang SC','Microsoft YaHei',sans-serif; fill: #334155; }
+      .tiny { font: 500 14px 'Arial','PingFang SC','Microsoft YaHei',sans-serif; fill: #475569; }
+      .group { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 24; ry: 24; }
+      .box { stroke: #334155; stroke-width: 2.2; rx: 18; ry: 18; }
+      .arrow { stroke: #475569; stroke-width: 3; fill: none; marker-end: url(#arrowHead); }
+      .dashed { stroke-dasharray: 9 7; }
+      .soft { stroke: #94a3b8; }
+    </style>
+    <marker id="arrowHead" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1060"/>
+
+  <text x="56" y="58" class="title">当前 HOR 方法网络结构图</text>
+  <text x="56" y="92" class="subtitle">多视角输入、单视角手物先验、主视角初始化、Stage2 轻量化 HO 交互、模板点云恢复</text>
+
+  <!-- top groups -->
+  <rect class="group" x="48" y="132" width="520" height="330"/>
+  <text x="72" y="172" class="stage">A. 多视角共享编码</text>
+
+  <rect class="group" x="614" y="132" width="540" height="330"/>
+  <text x="638" y="172" class="stage">B. Stage1 单视角手 + 物体初姿态</text>
+
+  <rect class="group" x="1200" y="132" width="552" height="330"/>
+  <text x="1224" y="172" class="stage">C. 多视角几何初始化</text>
+
+  <rect class="group" x="48" y="510" width="1704" height="360"/>
+  <text x="72" y="550" class="stage">D. Stage2 轻量化 Hand-Object 交互与 Master 输出</text>
+
+  <rect class="group" x="48" y="900" width="1704" height="118"/>
+  <text x="72" y="938" class="stage">E. 监督与评估</text>
+
+  <!-- A -->
+  <rect class="box" x="92" y="214" width="190" height="92" fill="#e0f2fe"/>
+  <text x="134" y="250" class="label">8 视角 RGB</text>
+  <text x="133" y="278" class="small">手物裁剪输入</text>
+
+  <rect class="box" x="340" y="214" width="182" height="92" fill="#e2e8f0"/>
+  <text x="374" y="250" class="label">ResNet34</text>
+  <text x="360" y="278" class="small">共享 Backbone</text>
+
+  <rect class="box" x="92" y="340" width="190" height="86" fill="#d9f99d"/>
+  <text x="117" y="375" class="label">多尺度特征图</text>
+  <text x="117" y="402" class="small">mlvl_feat</text>
+
+  <rect class="box" x="340" y="340" width="182" height="86" fill="#bfdbfe"/>
+  <text x="372" y="375" class="label">全局特征</text>
+  <text x="369" y="402" class="small">global_feat</text>
+
+  <!-- B -->
+  <rect class="box" x="660" y="204" width="210" height="84" fill="#fde68a"/>
+  <text x="705" y="239" class="label">Heatmap Decoder</text>
+  <text x="696" y="267" class="small">hand / obj heatmap</text>
+
+  <rect class="box" x="908" y="204" width="198" height="84" fill="#fde68a"/>
+  <text x="966" y="239" class="label">Occ Decoder</text>
+  <text x="972" y="267" class="small">obj occ map</text>
+
+  <rect class="box" x="660" y="322" width="210" height="94" fill="#fef3c7"/>
+  <text x="710" y="358" class="label">HOT + MANO</text>
+  <text x="689" y="386" class="small">SV hand mesh / joints</text>
+
+  <rect class="box" x="908" y="318" width="198" height="102" fill="#fee2e2"/>
+  <text x="936" y="354" class="label">SV Object Pose Head</text>
+  <text x="935" y="382" class="small">global_feat + hand_obj_fused</text>
+  <text x="953" y="405" class="tiny">输出 per-view rot6d / trans</text>
+
+  <!-- C -->
+  <rect class="box" x="1244" y="204" width="218" height="92" fill="#ede9fe"/>
+  <text x="1287" y="240" class="label">多视角投影/三角化</text>
+  <text x="1302" y="268" class="small">得到 ref hand</text>
+
+  <rect class="box" x="1512" y="204" width="196" height="92" fill="#fecaca"/>
+  <text x="1556" y="240" class="label">主视角提取</text>
+  <text x="1540" y="268" class="small">SV init rot / trans</text>
+
+  <rect class="box" x="1244" y="330" width="218" height="96" fill="#d1fae5"/>
+  <text x="1295" y="366" class="label">Master Hand Ref</text>
+  <text x="1289" y="394" class="small">以手根节点对齐</text>
+
+  <rect class="box" x="1512" y="330" width="196" height="96" fill="#ddd6fe"/>
+  <text x="1540" y="366" class="label">模板点云初始化</text>
+  <text x="1560" y="394" class="small">2048 object points</text>
+
+  <!-- D -->
+  <rect class="box" x="96" y="592" width="220" height="98" fill="#c7f9cc"/>
+  <text x="145" y="628" class="label">Feature Decode</text>
+  <text x="118" y="656" class="small">将多尺度图像特征变成 128D</text>
+  <text x="150" y="678" class="small">stage2 特征图</text>
+
+  <rect class="box" x="372" y="592" width="232" height="98" fill="#d1fae5"/>
+  <text x="418" y="628" class="label">Master Hand Mesh</text>
+  <text x="418" y="656" class="small">hand-only 分支先学稳手</text>
+  <text x="423" y="678" class="tiny">作为 object 交互的几何锚点</text>
+
+  <rect class="box" x="658" y="592" width="252" height="98" fill="#dcfce7"/>
+  <text x="706" y="628" class="label">Object 点特征采样</text>
+  <text x="682" y="656" class="small">初始化 object points 投影到各视角</text>
+  <text x="719" y="678" class="tiny">采样多视角 point features</text>
+
+  <rect class="box" x="966" y="592" width="268" height="98" fill="#bbf7d0"/>
+  <text x="1038" y="628" class="label">HO-Light</text>
+  <text x="992" y="656" class="small">1 次 object self-attn + 1 次 HO cross-attn</text>
+  <text x="1040" y="678" class="tiny">内部直接回归 rot / trans</text>
+
+  <rect class="box" x="1290" y="566" width="182" height="72" fill="#fecaca"/>
+  <text x="1322" y="610" class="label">输入种子姿态</text>
+
+  <rect class="box" x="1290" y="654" width="182" height="72" fill="#86efac"/>
+  <text x="1321" y="698" class="label">Master Rot / Trans</text>
+
+  <rect class="box" x="1520" y="592" width="190" height="98" fill="#cffafe"/>
+  <text x="1567" y="628" class="label">Master Obj Points</text>
+  <text x="1548" y="656" class="small">按 master pose 变换模板点云</text>
+  <text x="1587" y="678" class="tiny">obj_xyz_master</text>
+
+  <rect class="box" x="632" y="740" width="540" height="88" fill="#ffffff"/>
+  <text x="678" y="775" class="label">当前 Stage2 设计要点</text>
+  <text x="681" y="802" class="small">手分支先固定出较稳的 master hand，再让 object points 与 hand mesh 交互 1 次</text>
+
+  <!-- E -->
+  <rect class="box" x="90" y="952" width="470" height="42" fill="#fef2f2"/>
+  <text x="112" y="980" class="small">SV 监督：per-view camera-frame rot6d / trans</text>
+
+  <rect class="box" x="620" y="952" width="470" height="42" fill="#ecfccb"/>
+  <text x="652" y="980" class="small">Master 监督：master-frame rot6d / trans + 2048 点点云损失</text>
+
+  <rect class="box" x="1150" y="952" width="550" height="42" fill="#e0f2fe"/>
+  <text x="1178" y="980" class="small">评估：SVObjRec / MasterObjRec，普通 val 用 2048 点，最终 val 用 30000 点</text>
+
+  <!-- arrows main -->
+  <path class="arrow" d="M282 260 L340 260"/>
+  <path class="arrow" d="M431 306 L431 340"/>
+  <path class="arrow" d="M340 383 L282 383"/>
+
+  <path class="arrow" d="M522 254 L660 246"/>
+  <path class="arrow" d="M282 383 L660 368"/>
+  <path class="arrow" d="M522 383 L908 368"/>
+
+  <path class="arrow" d="M870 367 L1244 378"/>
+  <path class="arrow" d="M1106 369 L1512 378"/>
+  <path class="arrow" d="M870 248 L1244 250"/>
+  <path class="arrow" d="M1106 248 L1512 250"/>
+
+  <path class="arrow" d="M282 383 L96 641"/>
+  <path class="arrow" d="M1462 378 L1381 566"/>
+  <path class="arrow" d="M1462 378 L784 592"/>
+  <path class="arrow" d="M1708 378 L1381 566"/>
+  <path class="arrow" d="M1462 378 L488 592"/>
+
+  <path class="arrow" d="M316 641 L372 641"/>
+  <path class="arrow" d="M604 641 L658 641"/>
+  <path class="arrow" d="M910 641 L966 641"/>
+  <path class="arrow" d="M1234 641 L1290 641"/>
+  <path class="arrow" d="M1472 690 L1520 641"/>
+  <path class="arrow" d="M1381 638 L1381 654"/>
+  <path class="arrow" d="M1472 690 L1472 785 L1172 785"/>
+
+  <!-- helper arrows -->
+  <path class="arrow soft dashed" d="M765 416 L765 592"/>
+  <path class="arrow soft dashed" d="M1007 420 L1007 566 L1290 566"/>
+  <path class="arrow soft dashed" d="M1353 426 L1353 592"/>
+  <text x="1018" y="536" class="tiny">SV 主视角结果提供 stage2 seed</text>
+
+  <!-- supervision dashed -->
+  <path class="arrow dashed" d="M1007 420 L1007 952"/>
+  <path class="arrow dashed" d="M1615 690 L1615 952"/>
+  <path class="arrow dashed" d="M1381 726 L1381 952"/>
+  <path class="arrow dashed" d="M765 416 L325 952"/>
+
+  <!-- legend -->
+  <rect class="box" x="1438" y="736" width="274" height="96" fill="#ffffff"/>
+  <text x="1470" y="770" class="label" style="font-size:18px;">图示说明</text>
+  <text x="1471" y="796" class="tiny">实线：前向计算主链</text>
+  <text x="1471" y="818" class="tiny">虚线：初始化 / 监督依赖</text>
+
+</svg>

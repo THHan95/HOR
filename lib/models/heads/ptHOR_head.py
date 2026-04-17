@@ -11,6 +11,7 @@ from ...utils.builder import HEAD
 from ...utils.misc import param_size
 from ...utils.transform import (inverse_sigmoid, batch_cam_extr_transf, batch_cam_intr_projection, bchw_2_bhwc,
                                 denormalize, rot6d_to_rotmat, rotmat_to_rot6d)
+from ...utils.object_pose_utils import pose_from_keypoints
 from ..bricks.transformer import build_transformer
 from ..bricks.utils import ManoDecoder
 from ..layers.ptEmb_transformer import HORHandObjectContext, HORHandRefineContext
@@ -262,15 +263,9 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         self.stage2_obj_feat_min_scale = float(
             cfg.get("STAGE2_OBJ_FEAT_MIN_SCALE", cfg.get("STAGE3_OBJ_FEAT_MIN_SCALE", 0.2))
         )
-        self.stage2_pose_delta_min_scale = float(
-            cfg.get("STAGE2_POSE_DELTA_MIN_SCALE", cfg.get("STAGE3_POSE_DELTA_MIN_SCALE", 0.1))
-        )
         self.stage2_init_rot_min_scale = float(
             cfg.get("STAGE2_INIT_ROT_MIN_SCALE", cfg.get("STAGE3_INIT_ROT_MIN_SCALE", 0.1))
         )
-        self.obj_init_rot_delta_abs_max = float(cfg.get("OBJ_INIT_ROT_DELTA_ABS_MAX", 0.5))
-        self.obj_pose_rot_delta_abs_max = float(cfg.get("OBJ_POSE_ROT_DELTA_ABS_MAX", 0.2))
-        self.obj_pose_trans_delta_abs_max = float(cfg.get("OBJ_POSE_TRANS_DELTA_ABS_MAX", 0.1))
         super(HOR_Projective_SelfAggregation_Head, self).__init__(cfg)
 
     def _build_head_module(self):
@@ -283,9 +278,7 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         del self.transformer
         ho_transformer_cfg = self.cfg_transformer.clone()
         ho_transformer_cfg.defrost()
-        ho_transformer_cfg.TYPE = "HORTR_HO_Light"
-        ho_transformer_cfg.OBJ_POSE_ROT_DELTA_ABS_MAX = self.obj_pose_rot_delta_abs_max
-        ho_transformer_cfg.OBJ_POSE_TRANS_DELTA_ABS_MAX = self.obj_pose_trans_delta_abs_max
+        ho_transformer_cfg.TYPE = "HORTR_HO"
         ho_transformer_cfg.freeze()
         self.ho_transformer = build_transformer(ho_transformer_cfg)
 
@@ -296,13 +289,6 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         self.merge_net_feature.append(
             nn.Sequential(nn.Linear(self.embed_dims // 2, self.embed_dims // 2), nn.ReLU(),
                           nn.Linear(self.embed_dims // 2, self.embed_dims)))
-        self.obj_pose_delta_regressor = nn.Sequential(
-            nn.Linear(self.pt_feat_dim + self.embed_dims * 2 + 9, self.pt_feat_dim),
-            nn.ReLU(),
-            nn.Linear(self.pt_feat_dim, self.pt_feat_dim // 2),
-            nn.ReLU(),
-            nn.Linear(self.pt_feat_dim // 2, 9),
-        )
         self.obj_feat_fuser = nn.Sequential(
             nn.Linear(self.pt_feat_dim * 2, self.pt_feat_dim),
             nn.ReLU(),
@@ -409,16 +395,6 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         vis_points = src_points_sub[idx]
         viz_3d(image, vis_points)
 
-    def build_object_queries(self, obj_template, hand_center_point, obj_center_point):
-        if obj_template.dim() == 2:
-            obj_template = obj_template.unsqueeze(0).expand(hand_center_point.shape[0], -1, -1)
-        obj_trans_master = obj_center_point - hand_center_point
-        obj_template_norm = obj_template / self.mano_scale
-        obj_trans_norm = obj_trans_master / self.mano_scale
-        obj_xyz_norm = obj_template_norm + obj_trans_norm
-        obj_xyz_master = (obj_xyz_norm * self.mano_scale) + hand_center_point
-        return obj_xyz_norm, obj_xyz_master, obj_trans_master, obj_trans_norm
-
     def _sanitize_mano_tensor(self, tensor, abs_max, nan_value=0.0):
         return torch.nan_to_num(tensor, nan=nan_value, posinf=abs_max, neginf=-abs_max).clamp(-abs_max, abs_max)
 
@@ -490,75 +466,6 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             view_weights=mesh_view_weights,
         )
 
-    def build_object_point_view_weights(
-        self,
-        obj_xyz_master,
-        obj_center_master,
-        img_metas,
-        inp_res,
-        obj_view_conf,
-        obj_view_conf_xy,
-        obj_occ_map=None,
-    ):
-        if obj_view_conf is None and obj_view_conf_xy is None and obj_occ_map is None:
-            return None
-
-        num_cams = img_metas["cam_intr"].shape[1]
-        obj_points_mv = obj_xyz_master.unsqueeze(1).repeat(1, num_cams, 1, 1)
-        obj_center_mv = obj_center_master.unsqueeze(1).repeat(1, num_cams, 1, 1)
-        cam_extr_inv = torch.linalg.inv(img_metas["cam_extr"])
-
-        obj_points_cam = batch_cam_extr_transf(cam_extr_inv, obj_points_mv)
-        obj_center_cam = batch_cam_extr_transf(cam_extr_inv, obj_center_mv)
-        obj_points_2d = batch_cam_intr_projection(img_metas["cam_intr"], obj_points_cam)
-        obj_center_2d = batch_cam_intr_projection(img_metas["cam_intr"], obj_center_cam)
-
-        if obj_view_conf_xy is not None:
-            sigma_xy = 1.0 / obj_view_conf_xy.clamp(min=1e-6)
-        elif obj_view_conf is not None:
-            sigma_scalar = 1.0 / obj_view_conf.clamp(min=1e-6)
-            sigma_xy = sigma_scalar.unsqueeze(-1).expand(-1, -1, 2)
-        else:
-            sigma_xy = obj_points_2d.new_ones(obj_points_2d.shape[0], obj_points_2d.shape[1], 2)
-
-        point_offsets = torch.abs(obj_points_2d - obj_center_2d)
-        object_extent = point_offsets.amax(dim=2, keepdim=True).clamp(min=4.0)
-        support_xy = sigma_xy.unsqueeze(2) + object_extent
-        radial_weight = torch.exp(-0.5 * (((obj_points_2d - obj_center_2d) / support_xy.clamp(min=1e-6)) ** 2).sum(dim=-1))
-
-        img_w, img_h = float(inp_res[0].item()), float(inp_res[1].item())
-        in_front = (obj_points_cam[..., 2] > 1e-6).float()
-        in_frame = (
-            (obj_points_2d[..., 0] >= 0.0)
-            & (obj_points_2d[..., 0] < img_w)
-            & (obj_points_2d[..., 1] >= 0.0)
-            & (obj_points_2d[..., 1] < img_h)
-        ).float()
-        visibility = in_front * in_frame
-
-        if obj_view_conf_xy is not None:
-            base_view_weight = torch.sqrt(torch.prod(obj_view_conf_xy.clamp(min=1e-6), dim=-1)).unsqueeze(-1)
-        elif obj_view_conf is not None:
-            base_view_weight = obj_view_conf.unsqueeze(-1)
-        else:
-            base_view_weight = radial_weight.new_ones(radial_weight.shape[0], radial_weight.shape[1], 1)
-
-        occ_scores = 1.0
-        if obj_occ_map is not None:
-            occ_query = obj_points_2d.unsqueeze(-2)
-            occ_query = occ_query * (1.0 / inp_res).to(device=occ_query.device, dtype=occ_query.dtype).view(1, 1, 1, 1, 2)
-            occ_query = occ_query * 2.0 - 1.0
-            occ_scores = F.grid_sample(
-                obj_occ_map.flatten(0, 1),
-                occ_query.flatten(0, 1),
-                align_corners=False,
-            )
-            occ_scores = occ_scores.squeeze(1).squeeze(-1).view(obj_points_2d.shape[0], num_cams, obj_points_2d.shape[2])
-            occ_scores = occ_scores.clamp(min=0.0, max=1.0)
-
-        point_view_weights = radial_weight * visibility * base_view_weight * occ_scores
-        return point_view_weights.permute(0, 2, 1).contiguous()
-
     def build_object_points_from_pose(self, obj_template, hand_center_point, rot6d, trans_norm):
         rot6d = self._sanitize_obj_tensor(rot6d, self.obj_rot6d_abs_max)
         trans_norm = self._sanitize_obj_tensor(trans_norm, self.obj_trans_norm_abs_max)
@@ -582,28 +489,25 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             hand_center_expand = hand_center_point.view(*([1] * (rot6d.dim() - 2)), *hand_center_point.shape)
         obj_xyz_master = (obj_xyz_norm * self.mano_scale) + hand_center_expand
         obj_xyz_master = self._sanitize_obj_tensor(obj_xyz_master, self.obj_xyz_norm_abs_max * self.mano_scale)
-        obj_center_master = obj_xyz_master.mean(dim=-2, keepdim=True)
+        obj_centroid_master = obj_xyz_master.mean(dim=-2, keepdim=True)
         obj_trans = trans_norm * self.mano_scale
-        return obj_xyz_norm, obj_xyz_master, obj_center_master, obj_trans
+        return obj_xyz_norm, obj_xyz_master, obj_centroid_master, obj_trans
 
-    def update_object_pose(self, obj_feats, obj_center_feat, global_mv_feat, current_rot6d, current_trans_norm, warmup_scale=1.0):
-        global_obj_feat = self._sanitize_obj_tensor(obj_feats.mean(dim=1), self.obj_feat_abs_max)
-        obj_center_feat = self._sanitize_obj_tensor(obj_center_feat, self.obj_feat_abs_max)
-        global_mv_feat = self._sanitize_obj_tensor(global_mv_feat, self.obj_feat_abs_max)
-        current_rot6d = self._sanitize_obj_tensor(current_rot6d, self.obj_rot6d_abs_max)
-        current_trans_norm = self._sanitize_obj_tensor(current_trans_norm, self.obj_trans_norm_abs_max)
-        pose_input = self._sanitize_obj_tensor(
-            torch.cat((global_obj_feat, obj_center_feat, global_mv_feat, current_rot6d, current_trans_norm), dim=-1),
-            self.obj_feat_abs_max,
+    def recover_object_pose_from_keypoints(self, obj_template, obj_xyz_master, hand_center_point):
+        if hand_center_point.dim() == obj_xyz_master.dim():
+            hand_root = hand_center_point.squeeze(-2)
+        else:
+            expand_shape = list(obj_xyz_master.shape[:-2]) + [3]
+            hand_root = hand_center_point.squeeze(-2).view(*([1] * (obj_xyz_master.dim() - hand_center_point.dim())), *hand_center_point.squeeze(-2).shape)
+            hand_root = hand_root.expand(*expand_shape)
+        pose_dict = pose_from_keypoints(
+            rest_points=obj_template,
+            pred_points=obj_xyz_master,
+            hand_root=hand_root,
         )
-        raw_delta_pose = self.obj_pose_delta_regressor(pose_input)
-        delta_rot = torch.tanh(raw_delta_pose[:, :6]) * (self.obj_pose_rot_delta_abs_max * warmup_scale)
-        delta_trans = torch.tanh(raw_delta_pose[:, 6:]) * (self.obj_pose_trans_delta_abs_max * warmup_scale)
-        next_rot_seed = self._sanitize_obj_tensor(current_rot6d + delta_rot, self.obj_rot6d_abs_max)
-        next_rotmat = rot6d_to_rotmat(next_rot_seed)
-        next_rot6d = self._sanitize_obj_tensor(rotmat_to_rot6d(next_rotmat), self.obj_rot6d_abs_max)
-        next_trans_norm = self._sanitize_obj_tensor(current_trans_norm + delta_trans, self.obj_trans_norm_abs_max)
-        return next_rot6d, next_trans_norm
+        obj_rot6d = self._sanitize_obj_tensor(pose_dict["rot6d"], self.obj_rot6d_abs_max)
+        obj_trans = self._sanitize_obj_tensor(pose_dict["trans_rel"], self.obj_trans_norm_abs_max * self.mano_scale)
+        return obj_rot6d, obj_trans
 
     def build_hand_object_context(
         self,
@@ -612,17 +516,12 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         hand_mesh_master,
         current_rot6d,
         current_trans_norm,
-        obj_view_conf,
-        obj_view_conf_xy,
-        obj_occ_map,
         feat_map,
         img_metas,
         inp_res,
-        obj_center_feat,
         global_mv_feat,
         hand_update_scale,
         obj_feat_update_scale,
-        pose_delta_scale,
     ):
         return HORHandObjectContext(
             obj_template=obj_template,
@@ -630,23 +529,16 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             hand_mesh_master=hand_mesh_master,
             current_rot6d=current_rot6d,
             current_trans_norm=current_trans_norm,
-            obj_view_conf=obj_view_conf,
-            obj_view_conf_xy=obj_view_conf_xy,
-            obj_occ_map=obj_occ_map,
             feat_map=feat_map,
             img_metas=img_metas,
             inp_res=inp_res,
-            obj_center_feat=obj_center_feat,
             global_mv_feat=global_mv_feat,
             sample_multiview_features_fn=self.sample_multiview_features,
             project_points_to_views_fn=self.project_points_to_views,
             build_object_points_from_pose_fn=self.build_object_points_from_pose,
-            build_object_point_view_weights_fn=self.build_object_point_view_weights,
-            update_object_pose_fn=self.update_object_pose,
             obj_feat_fuser=self.obj_feat_fuser,
             hand_update_scale=hand_update_scale,
             obj_feat_update_scale=obj_feat_update_scale,
-            pose_delta_scale=pose_delta_scale,
         )
 
     def build_hand_refine_context(self, hand_center_point, anchor_verts_xyz_master, anchor_verts_xyz_norm, anchor_verts_feats_norm):
@@ -709,23 +601,13 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         # Accept the old kwarg name as a compatibility path during the transition to two-stage naming.
         stage2_warmup = float(kwargs.get("stage2_warmup", kwargs.get("stage3_warmup", 1.0)))
         hand_view_conf = kwargs.get("hand_view_conf", None)
-        obj_view_conf = kwargs.get("obj_view_conf", None)
-        obj_view_conf_xy = kwargs.get("obj_view_conf_xy", None)
-        obj_occ_map = kwargs.get("obj_occ_map", None)
-        obj_center_query_2d = kwargs.get("obj_center_query_2d", None)
-        sv_rot_outputs = kwargs.get("sv_rot_outputs", None)
+        sv_rot_outputs = kwargs.get("sv_rot_outputs", kwargs.get("sv_pose_outputs", None))
         obj_init_rot6d = kwargs.get("obj_init_rot6d", None)
+        obj_init_trans = kwargs.get("obj_init_trans", None)
         x = mlvl_feat
         batch_size, num_cams = x.size(0), x.size(1)
         if hand_view_conf is not None:
             hand_view_conf = hand_view_conf.to(device=x.device, dtype=x.dtype).permute(0, 2, 1).contiguous()
-        if obj_view_conf is not None:
-            obj_view_conf = obj_view_conf.to(device=x.device, dtype=x.dtype).permute(0, 2, 1).contiguous()
-        if obj_view_conf_xy is not None:
-            obj_view_conf_xy = obj_view_conf_xy.to(device=x.device, dtype=x.dtype)
-            obj_view_conf_xy = obj_view_conf_xy.mean(dim=2) if obj_view_conf_xy.dim() == 4 and obj_view_conf_xy.shape[2] > 1 else obj_view_conf_xy.squeeze(2)
-        if obj_occ_map is not None:
-            obj_occ_map = obj_occ_map.to(device=x.device, dtype=x.dtype)
         mano_3d_sv = mano_3d_sv.view(batch_size, num_cams, *mano_3d_sv.shape[1:])  # (B, N, 799, 3)
         batch_idx = torch.arange(batch_size, device=mano_3d_sv.device)
         mano_3d_master = mano_3d_sv[batch_idx, img_metas["master_id"]]  # (B, 799, 3)
@@ -745,19 +627,18 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
         x = x + sin_embed
 
         hand_center_point = reference_hand[:, self.transformer_center_idx:self.transformer_center_idx+1, :]
-        obj_center_point = reference_obj
-        _, obj_xyz_master_init, obj_trans_master, obj_trans_norm = self.build_object_queries(
-            obj_template=obj_template,
-            hand_center_point=hand_center_point,
-            obj_center_point=obj_center_point,
-        )
+        if obj_init_trans is not None:
+            obj_init_trans = self._sanitize_obj_tensor(
+                obj_init_trans.to(device=x.device, dtype=x.dtype),
+                self.mano_scale * self.obj_trans_norm_abs_max,
+            )
+            obj_trans_norm = self._sanitize_obj_tensor(obj_init_trans / self.mano_scale, self.obj_trans_norm_abs_max)
+        else:
+            obj_trans_norm = x.new_zeros(batch_size, 3)
 
         ref_hand_mesh = mano_3d_master + hand_center_point
         ref_hand_mesh_2d = self.project_points_to_views(ref_hand_mesh, img_metas, inp_res)
         ref_hand_joints_2d = self.project_points_to_views(reference_hand, img_metas, inp_res)
-        obj_center_2d = self.project_points_to_views(obj_center_point, img_metas, inp_res)
-        if obj_center_query_2d is None:
-            obj_center_query_2d = obj_center_2d
         hand_mesh_view_conf = self._interpolate_point_view_weights(ref_hand_mesh, reference_hand, hand_view_conf)
         hand_mesh_feats = self.sample_multiview_features(
             x,
@@ -774,12 +655,26 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             anchor_verts_xyz_norm = hand_mesh_xyz_norm[:, :778]
             anchor_verts_xyz_master = ref_hand_mesh[:, :778]
             anchor_verts_feats_norm = hand_mesh_feats[:, :778]
-            current_rot6d = self.identity_rot6d.unsqueeze(0).expand(batch_size, -1)
-            current_obj_xyz_norm, current_obj_xyz_master, current_obj_center_master, current_obj_trans = self.build_object_points_from_pose(
+            if obj_init_rot6d is None and sv_rot_outputs is not None:
+                obj_init_rot6d = sv_rot_outputs.get("obj_init_rot6d", sv_rot_outputs.get("obj_fused_rot6d_sv", None))
+            if obj_init_rot6d is None:
+                obj_init_rot6d = self.identity_rot6d.unsqueeze(0).expand(batch_size, -1)
+            current_rot6d = self._sanitize_obj_tensor(
+                obj_init_rot6d.to(device=x.device, dtype=x.dtype),
+                self.obj_rot6d_abs_max,
+            )
+            if obj_init_trans is not None:
+                current_trans_norm = self._sanitize_obj_tensor(
+                    (obj_init_trans.to(device=x.device, dtype=x.dtype) / self.mano_scale),
+                    self.obj_trans_norm_abs_max,
+                )
+            else:
+                current_trans_norm = obj_trans_norm
+            current_obj_xyz_norm, current_obj_xyz_master, _, current_obj_trans = self.build_object_points_from_pose(
                 obj_template,
                 hand_center_point,
                 current_rot6d,
-                obj_trans_norm.squeeze(1),
+                current_trans_norm,
             )
             hand_joint_feats = self.sample_multiview_features(
                 x,
@@ -824,10 +719,12 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
 
             n_layers = all_hand_xyz.shape[0]
             all_obj_xyz = current_obj_xyz_master.unsqueeze(0).expand(n_layers, -1, -1, -1).contiguous()
-            all_obj_center = current_obj_center_master.unsqueeze(0).expand(n_layers, -1, -1, -1).contiguous()
-            all_obj_rot6d = current_rot6d.unsqueeze(0).expand(n_layers, -1, -1).contiguous()
-            all_obj_trans = current_obj_trans.unsqueeze(0).expand(n_layers, -1, -1).contiguous()
-            results["pred_obj_trans_master"] = current_obj_trans.unsqueeze(1)
+            all_obj_rot6d, all_obj_trans = self.recover_object_pose_from_keypoints(
+                obj_template,
+                all_obj_xyz,
+                hand_center_point,
+            )
+            results["pred_obj_trans_master"] = all_obj_trans[-1].unsqueeze(1)
             pred_mano_mesh_xyz_master = pred_kp_mano_mesh_xyz_master
             pred_mano_params_master = pred_kp_mano_params_master
             results["pred_kp_mano_mesh_xyz_master"] = pred_kp_mano_mesh_xyz_master
@@ -838,15 +735,6 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             # directly regresses the final master pose.
             hand_update_scale = 0.0
             obj_feat_update_scale = self.stage2_obj_feat_min_scale + (1.0 - self.stage2_obj_feat_min_scale) * stage2_warmup
-            pose_delta_scale = self.stage2_pose_delta_min_scale + (1.0 - self.stage2_pose_delta_min_scale) * stage2_warmup
-            obj_center_feat = self.sample_multiview_features(
-                x,
-                obj_center_query_2d,
-                batch_size,
-                num_cams,
-                1,
-                view_weights=obj_view_conf,
-            ).squeeze(1)
 
             anchor_verts_xyz_norm = hand_mesh_xyz_norm[:, :778]
             anchor_verts_xyz_master = ref_hand_mesh[:, :778]
@@ -910,21 +798,18 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
                 obj_init_rot6d.to(device=x.device, dtype=x.dtype),
                 self.obj_rot6d_abs_max,
             )
-            current_trans_norm = obj_trans_norm.squeeze(1)
-            current_obj_xyz_norm, current_obj_xyz_master, current_obj_center_master, _ = self.build_object_points_from_pose(
+            if obj_init_trans is not None:
+                current_trans_norm = self._sanitize_obj_tensor(
+                    (obj_init_trans.to(device=x.device, dtype=x.dtype) / self.mano_scale),
+                    self.obj_trans_norm_abs_max,
+                )
+            else:
+                current_trans_norm = obj_trans_norm.squeeze(1)
+            current_obj_xyz_norm, current_obj_xyz_master, _, _ = self.build_object_points_from_pose(
                 obj_template,
                 hand_center_point,
                 current_rot6d,
                 current_trans_norm,
-            )
-            obj_point_view_weights = self.build_object_point_view_weights(
-                current_obj_xyz_master,
-                current_obj_center_master,
-                img_metas,
-                inp_res,
-                obj_view_conf.squeeze(1) if obj_view_conf is not None and obj_view_conf.shape[1] == 1 else obj_view_conf,
-                obj_view_conf_xy,
-                obj_occ_map,
             )
             current_obj_query_2d = self.project_points_to_views(current_obj_xyz_master, img_metas, inp_res)
             current_obj_feats = self.sample_multiview_features(
@@ -933,7 +818,6 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
                 batch_size,
                 num_cams,
                 current_obj_xyz_master.shape[1],
-                view_weights=obj_point_view_weights,
             )
             current_obj_feats = self._sanitize_obj_tensor(current_obj_feats, self.obj_feat_abs_max)
             hand_object_context = self.build_hand_object_context(
@@ -942,17 +826,12 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
                 hand_mesh_master=pred_kp_mano_mesh_xyz_master,
                 current_rot6d=current_rot6d,
                 current_trans_norm=current_trans_norm,
-                obj_view_conf=obj_view_conf.squeeze(1) if obj_view_conf is not None and obj_view_conf.shape[1] == 1 else obj_view_conf,
-                obj_view_conf_xy=obj_view_conf_xy,
-                obj_occ_map=obj_occ_map,
                 feat_map=x,
                 img_metas=img_metas,
                 inp_res=inp_res,
-                obj_center_feat=obj_center_feat,
                 global_mv_feat=global_mv_feat,
                 hand_update_scale=hand_update_scale,
                 obj_feat_update_scale=obj_feat_update_scale,
-                pose_delta_scale=pose_delta_scale,
             )
             ho_transformer_outputs = self.ho_transformer(
                 query_xyz=current_obj_xyz_norm,
@@ -965,9 +844,11 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             n_layers = ho_transformer_outputs.all_obj_xyz_master.shape[0]
             all_hand_xyz = pred_kp_mano_mesh_xyz_master.unsqueeze(0).expand(n_layers, -1, -1, -1).contiguous()
             all_obj_xyz = ho_transformer_outputs.all_obj_xyz_master
-            all_obj_center = ho_transformer_outputs.all_obj_center_xyz_master
-            all_obj_rot6d = ho_transformer_outputs.all_obj_rot6d
-            all_obj_trans = ho_transformer_outputs.all_obj_trans
+            all_obj_rot6d, all_obj_trans = self.recover_object_pose_from_keypoints(
+                obj_template,
+                all_obj_xyz,
+                hand_center_point,
+            )
 
             pred_mano_mesh_xyz_master = pred_kp_mano_mesh_xyz_master
             pred_mano_params_master = pred_kp_mano_params_master
@@ -977,21 +858,21 @@ class HOR_Projective_SelfAggregation_Head(BasePointEmbedHead):
             if sv_rot_outputs is not None:
                 results["obj_view_rot6d_cam"] = sv_rot_outputs.get("obj_view_rot6d_cam", None)
                 results["obj_view_rot6d_master"] = sv_rot_outputs.get("obj_view_rot6d_master", None)
-                results["obj_view_rot_conf"] = sv_rot_outputs.get("obj_view_rot_conf", None)
-                results["obj_view_rot_weights"] = sv_rot_outputs.get("obj_view_rot_weights", None)
-                results["obj_view_rot_valid"] = sv_rot_outputs.get("obj_view_rot_valid", None)
+                results["obj_view_trans"] = sv_rot_outputs.get("obj_view_trans", None)
+                results["obj_view_trans_master"] = sv_rot_outputs.get("obj_view_trans_master", None)
                 results["obj_fused_rot6d_sv"] = sv_rot_outputs.get("obj_fused_rot6d_sv", current_rot6d)
+                results["obj_fused_trans_sv"] = sv_rot_outputs.get("obj_fused_trans_sv", current_trans_norm * self.mano_scale)
             results["obj_init_rot6d"] = current_rot6d
+            results["obj_init_trans"] = current_trans_norm * self.mano_scale
 
         results["all_hand_mesh_xyz_master"] = all_hand_xyz
         results["all_obj_xyz_master"] = all_obj_xyz
-        results["all_obj_center_xyz_master"] = all_obj_center
         results["all_obj_rot6d"] = all_obj_rot6d
         results["all_obj_trans"] = all_obj_trans
         results["pred_mano_mesh_xyz_master"] = pred_mano_mesh_xyz_master
         results["pred_mano_params_master"] = pred_mano_params_master
         if "pred_obj_trans_master" not in results:
-            results["pred_obj_trans_master"] = obj_trans_master
+            results["pred_obj_trans_master"] = obj_trans_norm.unsqueeze(1) * self.mano_scale
         results["interaction_mode"] = interaction_mode
         # results["obj_xyz"] = obj_xyz_ori
         # results["enhanced_img_feat"] = x

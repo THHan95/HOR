@@ -14,7 +14,6 @@ class ObjectPoseMetric(Metric):
         self.name = name
         self.rot_deg = AverageMeter(f"{name}_rot_deg")
         self.trans_epe = AverageMeter(f"{name}_trans_epe")
-        self.center_epe = AverageMeter(f"{name}_center_epe")
         self.add = AverageMeter(f"{name}_add")
         self.adds = AverageMeter(f"{name}_adds")
         self.reset()
@@ -23,7 +22,6 @@ class ObjectPoseMetric(Metric):
         self.count = 0
         self.rot_deg.reset()
         self.trans_epe.reset()
-        self.center_epe.reset()
         self.add.reset()
         self.adds.reset()
 
@@ -37,18 +35,14 @@ class ObjectPoseMetric(Metric):
     def feed(self,
              pred_rot6d,
              pred_trans,
-             pred_center,
              gt_rot6d,
              gt_trans,
-             gt_center,
              obj_points_rest,
              **kwargs):
         pred_rot6d = pred_rot6d.detach()
         pred_trans = pred_trans.detach()
-        pred_center = pred_center.detach()
         gt_rot6d = gt_rot6d.detach()
         gt_trans = gt_trans.detach()
-        gt_center = gt_center.detach()
         obj_points_rest = obj_points_rest.detach()
         batch_size = pred_rot6d.shape[0]
 
@@ -59,10 +53,7 @@ class ObjectPoseMetric(Metric):
         cos_theta = torch.clamp((trace - 1.0) * 0.5, min=-1.0 + 1e-6, max=1.0 - 1e-6)
         rot_deg = torch.rad2deg(torch.acos(cos_theta))
 
-        pred_center = pred_center.squeeze(1) if pred_center.dim() == 3 else pred_center
-        gt_center = gt_center.squeeze(1) if gt_center.dim() == 3 else gt_center
         trans_epe = torch.norm(pred_trans - gt_trans, dim=-1)
-        center_epe = torch.norm(pred_center - gt_center, dim=-1)
 
         pred_points = self._apply_pose(obj_points_rest, pred_rot6d, pred_trans)
         gt_points = self._apply_pose(obj_points_rest, gt_rot6d, gt_trans)
@@ -73,7 +64,6 @@ class ObjectPoseMetric(Metric):
 
         self.rot_deg.update(rot_deg.sum().item(), batch_size)
         self.trans_epe.update(trans_epe.sum().item(), batch_size)
-        self.center_epe.update(center_epe.sum().item(), batch_size)
         self.add.update(add.sum().item(), batch_size)
         self.adds.update(adds.sum().item(), batch_size)
         self.count += batch_size
@@ -82,7 +72,6 @@ class ObjectPoseMetric(Metric):
         return {
             f"{self.name}_rot_deg": self.rot_deg.avg,
             f"{self.name}_trans_epe": self.trans_epe.avg,
-            f"{self.name}_center_epe": self.center_epe.avg,
             f"{self.name}_add": self.add.avg,
             f"{self.name}_adds": self.adds.avg,
         }
@@ -93,6 +82,6 @@ class ObjectPoseMetric(Metric):
     def __str__(self) -> str:
         return (
             f"{self.name} ADD/ADDS {self.add.avg * 1000.0:.1f}/{self.adds.avg * 1000.0:.1f} mm | "
-            f"C/T {self.center_epe.avg * 1000.0:.1f}/{self.trans_epe.avg * 1000.0:.1f} mm | "
+            f"T {self.trans_epe.avg * 1000.0:.1f} mm | "
             f"R {self.rot_deg.avg:.1f} deg"
         )

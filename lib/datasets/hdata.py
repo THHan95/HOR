@@ -46,6 +46,7 @@ class HDataset(torch.utils.data.Dataset, ABC):
         self.sides = CONST.SIDE
         self.njoints = CONST.NUM_JOINTS
         self.current_stage_name = "stage2"
+        self.quiet_init = bool(cfg.get("QUIET_INIT", False))
         self.stage12_bbox_expand_ratio = float(cfg.DATA_PRESET.get("STAGE12_BBOX_EXPAND_RATIO", 1.5))
         self.stage12_use_hand_obj_bbox = bool(cfg.DATA_PRESET.get("STAGE12_USE_HAND_OBJ_BBOX", False))
         # Keep the old bbox key as a fallback so existing data presets do not break.
@@ -59,7 +60,8 @@ class HDataset(torch.utils.data.Dataset, ABC):
         self.transform = build_transform(cfg=cfg.TRANSFORM,
                                          data_preset=self.data_preset,
                                          is_train="train" in self.data_split)
-        logger.info(f"Initialized abstract class: {self.name}")
+        if not self.quiet_init:
+            logger.info(f"Initialized abstract class: {self.name}")
 
     def __len__(self):
         return len(self)
@@ -183,14 +185,6 @@ class HDataset(torch.utils.data.Dataset, ABC):
                      ((joints_2d[:, 1] >= 0) & (joints_2d[:, 1] < raw_size[1]))
         return joints_vis.astype(np.float32)
 
-    def get_obj_center_2d_vis(self, obj_center_2d=None, raw_size=None, **kwargs):
-        """Check if object center is visible in raw image"""
-        if obj_center_2d is None or raw_size is None:
-            return None
-        obj_center_vis = ((obj_center_2d[:, 0] >= 0) & (obj_center_2d[:, 0] < raw_size[0])) & \
-                         ((obj_center_2d[:, 1] >= 0) & (obj_center_2d[:, 1] < raw_size[1]))
-        return obj_center_vis.astype(np.float32)
-
     def getitem_2d(self, idx):
         hand_side = self.get_sides(idx)
         bbox_center, bbox_scale = self.get_bbox_center_scale(idx)
@@ -292,17 +286,13 @@ class HDataset(torch.utils.data.Dataset, ABC):
         obj_id = obj_data["obj_id"]
         pc_sparse_rest = obj_data["sparse_rest"]
         pc_eval_rest = obj_data.get("eval_rest", None)
+        obj_kp21_rest = obj_data.get("kp21_rest", None)
+        obj_kp21_cam = obj_data.get("kp21_cam", None)
         pc_sparse_cam = obj_data["sparse_cam"]
         pc_dense_cam = obj_data["dense_cam"]
         R_label = obj_data["R_label"]           # (3, 3) 相机系下的绝对旋转
         t_label_rel = obj_data["t_label_rel"]   # (3,) 相对于手腕的平移
         rot6d_label = obj_data["rot6d_label"]   # (6,) 
-
-        # 🚨 修复 1：提供全零占位符，消灭 None
-        if pc_sparse_cam is not None:
-            obj_center_3d = np.mean(pc_sparse_cam, axis=0, keepdims=True).astype(np.float32)
-        else:
-            obj_center_3d = np.zeros((1, 3), dtype=np.float32)
 
         _, obj_transform = self.get_obj_info(idx)
         
@@ -335,9 +325,9 @@ class HDataset(torch.utils.data.Dataset, ABC):
             if pc_sparse_cam is not None:
                 pc_sparse_cam = self.flip_3d(pc_sparse_cam)
                 pc_dense_cam = self.flip_3d(pc_dense_cam)
+            if obj_kp21_cam is not None:
+                obj_kp21_cam = self.flip_3d(obj_kp21_cam)
                 
-            obj_center_3d = self.flip_3d(obj_center_3d)
-            
             # 翻转相对平移 t_rel
             t_label_rel = self.flip_3d(t_label_rel.reshape(1, 3)).flatten()
 
@@ -354,6 +344,8 @@ class HDataset(torch.utils.data.Dataset, ABC):
                 pc_sparse_rest = self.flip_3d(pc_sparse_rest)
             if pc_eval_rest is not None:
                 pc_eval_rest = self.flip_3d(pc_eval_rest)
+            if obj_kp21_rest is not None:
+                obj_kp21_rest = self.flip_3d(obj_kp21_rest)
 
             # 翻转 obj_transform
             flip_mat = np.array([[-1, 0, 0, 0],
@@ -382,9 +374,10 @@ class HDataset(torch.utils.data.Dataset, ABC):
             "obj_id": obj_id,
             "obj_pc_sparse_rest": pc_sparse_rest,
             "obj_pc_eval_rest": pc_eval_rest,
+            "obj_kp21_rest": obj_kp21_rest,
+            "obj_kp21": obj_kp21_cam,
             "obj_pc_sparse": pc_sparse_cam,       
             "obj_pc_dense": pc_dense_cam,
-            "obj_center_3d": obj_center_3d,
             "obj_transform": obj_transform,
             "obj_trans_3d": obj_trans_3d,
             "R_label": R_label,

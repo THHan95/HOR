@@ -16,6 +16,7 @@ import yaml
 from manotorch.manolayer import ManoLayer, MANOOutput
 from pytorch3d.structures import Meshes
 from pytorch3d.ops import sample_points_from_meshes
+from scipy.spatial import cKDTree as KDTree
 from scipy.spatial.distance import cdist
 from termcolor import colored
 
@@ -26,6 +27,58 @@ from ..utils.logger import logger
 from ..utils.transform import (batch_ref_bone_len, bbox_xywh_to_xyxy, cal_transform_mean, get_annot_center,
                                get_annot_scale, persp_project, rotmat_to_rot6d, SE3_transform, process_bbox)
 from .hdata import HDataset, kpId2vertices
+
+
+def _bbox21_from_bounds(bounds):
+    bounds = np.asarray(bounds, dtype=np.float32)
+    x_min, y_min, z_min = bounds[0]
+    x_max, y_max, z_max = bounds[1]
+    p_blb = np.array([x_min, y_min, z_min], dtype=np.float32)
+    p_brb = np.array([x_max, y_min, z_min], dtype=np.float32)
+    p_blf = np.array([x_min, y_max, z_min], dtype=np.float32)
+    p_brf = np.array([x_max, y_max, z_min], dtype=np.float32)
+    p_tlb = np.array([x_min, y_min, z_max], dtype=np.float32)
+    p_trb = np.array([x_max, y_min, z_max], dtype=np.float32)
+    p_tlf = np.array([x_min, y_max, z_max], dtype=np.float32)
+    p_trf = np.array([x_max, y_max, z_max], dtype=np.float32)
+    p_center = (p_tlb + p_brf) * 0.5
+    p_ble = (p_blb + p_blf) * 0.5
+    p_bre = (p_brb + p_brf) * 0.5
+    p_bfe = (p_blf + p_brf) * 0.5
+    p_bbe = (p_blb + p_brb) * 0.5
+    p_tle = (p_tlb + p_tlf) * 0.5
+    p_tre = (p_trb + p_trf) * 0.5
+    p_tfe = (p_tlf + p_trf) * 0.5
+    p_tbe = (p_tlb + p_trb) * 0.5
+    p_lfe = (p_tlf + p_blf) * 0.5
+    p_lbe = (p_tlb + p_blb) * 0.5
+    p_rfe = (p_trf + p_brf) * 0.5
+    p_rbe = (p_trb + p_brb) * 0.5
+    return np.stack(
+        (
+            p_blb, p_brb, p_blf, p_brf,
+            p_tlb, p_trb, p_tlf, p_trf,
+            p_ble, p_bre, p_bfe, p_bbe,
+            p_tle, p_tre, p_tfe, p_tbe,
+            p_lfe, p_lbe, p_rfe, p_rbe,
+            p_center,
+        ),
+        axis=0,
+    ).astype(np.float32)
+
+
+def _transform_points(verts, transform):
+    verts = np.asarray(verts, dtype=np.float32)
+    transform = np.asarray(transform, dtype=np.float32)
+    rot = transform[:3, :3]
+    trans = transform[:3, 3]
+    return (rot @ verts.T).T + trans[None, :]
+
+
+def _min_surface_distance_obj_to_hand(hand_verts, obj_verts):
+    hand_tree = KDTree(np.asarray(hand_verts, dtype=np.float32))
+    dists, _ = hand_tree.query(np.asarray(obj_verts, dtype=np.float32))
+    return float(dists.min())
 
 
 @DATASET.register_module()
@@ -46,6 +99,7 @@ class DexYCB(HDataset):
 
         self.use_left_hand = cfg.USE_LEFT_HAND
         self.filter_invisible_hand = cfg.FILTER_INVISIBLE_HAND
+        self.quiet_init = bool(cfg.get("QUIET_INIT", False))
         self.dex_ycb = None
 
         self.dexycb_mano_right = ManoLayer(
@@ -90,7 +144,8 @@ class DexYCB(HDataset):
         os.makedirs(cache_folder, exist_ok=True)
 
         dexycb_name = f"{self.setup}_{self.data_split}"
-        logger.info(f"DexYCB use split: {dexycb_name}")
+        if not self.quiet_init:
+            logger.info(f"DexYCB use split: {dexycb_name}")
         self.dex_ycb: DexYCBDataset = get_dataset(dexycb_name)
         self.raw_size = (640, 480)
 
@@ -98,7 +153,8 @@ class DexYCB(HDataset):
         if self.use_cache and os.path.exists(self.cache_path):
             with open(self.cache_path, "rb") as p_f:
                 self.sample_idxs = pickle.load(p_f)
-            logger.info(f"Loaded cache for {self.name}_{self.data_split}_{self.setup} from {self.cache_path}")
+            if not self.quiet_init:
+                logger.info(f"Loaded cache for {self.name}_{self.data_split}_{self.setup} from {self.cache_path}")
         else:
             self.sample_idxs = []
             for i, (seq_id, cam_id, frame_id) in enumerate(etqdm(self.dex_ycb._mapping)):
@@ -116,14 +172,17 @@ class DexYCB(HDataset):
             if self.use_cache:
                 with open(self.cache_path, "wb") as p_f:
                     pickle.dump(self.sample_idxs, p_f)
-                logger.info(f"Wrote cache for {self.name}_{self.data_split}_{self.setup} to {self.cache_path}")
+                if not self.quiet_init:
+                    logger.info(f"Wrote cache for {self.name}_{self.data_split}_{self.setup} to {self.cache_path}")
         # endregion
         self.obj_rest_corners = {}
+        self.obj_kp21_rest = {}
         self.obj_pc_sparse = {}
         self.obj_pc_dense = {}
         self.obj_pc_eval = {}
 
-        logger.info("Pre-sampling YCB objects (Sparse: 2048, Dense: 16384, Eval: 30000)...")
+        if not self.quiet_init:
+            logger.info("Pre-sampling YCB objects (Sparse: 2048, Dense: 16384, Eval: 30000)...")
         for obj_id, obj_file in self.dex_ycb.obj_file.items():
             object_mesh = trimesh.load(obj_file, process=False)
 
@@ -136,11 +195,13 @@ class DexYCB(HDataset):
             pc_eval = sample_points_from_meshes(pt3d_mesh, 30000)[0].numpy()
 
             self.obj_rest_corners[obj_id] = trimesh.bounds.corners(object_mesh.bounds)
+            self.obj_kp21_rest[obj_id] = _bbox21_from_bounds(object_mesh.bounds)
             self.obj_pc_sparse[obj_id] = pc_sparse.astype(np.float32)
             self.obj_pc_dense[obj_id] = pc_dense.astype(np.float32)
             self.obj_pc_eval[obj_id] = pc_eval.astype(np.float32)
 
-        logger.info("YCB dual-scale point clouds loaded successfully!")
+        if not self.quiet_init:
+            logger.info("YCB dual-scale point clouds loaded successfully!")
 
     def __len__(self):
         return len(self.sample_idxs)
@@ -176,6 +237,7 @@ class DexYCB(HDataset):
         pc_sparse_rest = self.obj_pc_sparse[obj_id]
         pc_dense_rest = self.obj_pc_dense[obj_id]
         pc_eval_rest = self.obj_pc_eval[obj_id]
+        kp21_rest = self.obj_kp21_rest[obj_id]
 
         hand_joints_3d = self.get_joints_3d(idx)
         hand_root_cam = hand_joints_3d[9].reshape(3, 1)
@@ -190,6 +252,7 @@ class DexYCB(HDataset):
 
         pc_sparse_cam = (R_obj_cam @ pc_sparse_rest.T).T + t_obj_cam.flatten()
         pc_dense_cam = (R_obj_cam @ pc_dense_rest.T).T + t_obj_cam.flatten()
+        kp21_cam = (R_obj_cam @ kp21_rest.T).T + t_obj_cam.flatten()
 
         return {
             "obj_id": obj_id,
@@ -198,6 +261,8 @@ class DexYCB(HDataset):
             "rot6d_label": rot6d_label,
             "sparse_rest": pc_sparse_rest,
             "eval_rest": pc_eval_rest,
+            "kp21_rest": kp21_rest,
+            "kp21_cam": kp21_cam.astype(np.float32),
             "sparse_cam": pc_sparse_cam.astype(np.float32),
             "dense_cam": pc_dense_cam.astype(np.float32),
         }
@@ -384,8 +449,13 @@ class DexYCBMultiView(torch.utils.data.Dataset):
         self.n_views = cfg.N_VIEWS
         self.data_split = cfg.DATA_SPLIT
         self.skip_frames = cfg.get("SKIP_FRAMES", 0)
+        self.use_cache = cfg.DATA_PRESET.USE_CACHE
         assert self.data_split in ["train", "val", "test"], f"{self.name} unsupport data split {self.data_split}"
         self.test_with_multiview = cfg.get("TEST_WITH_MULTIVIEW", False)
+        self.max_hand_obj_surface_dist_mm = cfg.get("MAX_HAND_OBJ_SURFACE_DIST_MM", 5.0)
+        self.enable_hand_obj_contact_filter = (
+            self.max_hand_obj_surface_dist_mm is not None and float(self.max_hand_obj_surface_dist_mm) > 0.0
+        )
 
         self.master_system = cfg.get("MASTER_SYSTEM", "default")
         if self.master_system == "default":
@@ -465,14 +535,24 @@ class DexYCBMultiView(torch.utils.data.Dataset):
                     self.multiview_sample_infos.append(copy.deepcopy(curr_sample_infos))
 
         total_len = len(self.multiview_sample_idxs)
+        base_valid_sample_idx_list = list(range(total_len))
+        if self.enable_hand_obj_contact_filter:
+            base_valid_sample_idx_list = self._filter_multiview_samples_by_surface_distance(base_valid_sample_idx_list)
         if self.skip_frames != 0:
-            self.valid_sample_idx_list = [i for i in range(total_len) if i % (self.skip_frames + 1) == 0]
+            self.valid_sample_idx_list = [
+                valid_idx for order_idx, valid_idx in enumerate(base_valid_sample_idx_list)
+                if order_idx % (self.skip_frames + 1) == 0
+            ]
         else:
-            self.valid_sample_idx_list = [i for i in range(total_len)]
+            self.valid_sample_idx_list = base_valid_sample_idx_list
 
         self.len = len(self.valid_sample_idx_list)
+        filter_desc = (
+            f", max_hand_obj_surface_dist_mm={float(self.max_hand_obj_surface_dist_mm):.3f}"
+            if self.enable_hand_obj_contact_filter else ", max_hand_obj_surface_dist_mm=disabled"
+        )
         logger.warning(f"{self.name} {self.setup}_{self.data_split} Init Done. "
-                       f"Skip frames: {self.skip_frames}, total {self.len} samples")
+                       f"Skip frames: {self.skip_frames}, total {self.len} samples{filter_desc}")
         self.current_stage_name = "stage3"
 
     def set_stage(self, stage_name: str):
@@ -492,6 +572,7 @@ class DexYCBMultiView(torch.utils.data.Dataset):
             FILTER_INVISIBLE_HAND=self.cfg.FILTER_INVISIBLE_HAND,
             TRANSFORM=self.cfg.TRANSFORM,
             DATA_PRESET=self.cfg.DATA_PRESET,
+            QUIET_INIT=True,
         )
 
         cfg_val, cfg_test = cfg_train.copy(), cfg_train.copy()
@@ -502,7 +583,83 @@ class DexYCBMultiView(torch.utils.data.Dataset):
         dex_ycb_val = DexYCB(CN(cfg_val))
         dex_ycb_test = DexYCB(CN(cfg_test))
 
+        logger.info(
+            f"{self.name} source sets ready: "
+            f"{self.setup}_train={len(dex_ycb_train.sample_idxs)}, "
+            f"{self.setup}_val={len(dex_ycb_val.sample_idxs)}, "
+            f"{self.setup}_test={len(dex_ycb_test.sample_idxs)}"
+        )
+
         return dex_ycb_train, dex_ycb_val, dex_ycb_test
+
+    def _build_surface_filter_cache_path(self):
+        cache_identifier_dict = {
+            "cache_version": "v1_hand_obj_surface_filter",
+            "setup": self.setup,
+            "data_split": self.data_split,
+            "test_with_multiview": self.test_with_multiview,
+            "max_hand_obj_surface_dist_mm": float(self.max_hand_obj_surface_dist_mm),
+            "source_train_cache": getattr(self.set_mappings[f"{self.setup}_train"], "cache_identifier", "na"),
+            "source_val_cache": getattr(self.set_mappings[f"{self.setup}_val"], "cache_identifier", "na"),
+            "source_test_cache": getattr(self.set_mappings[f"{self.setup}_test"], "cache_identifier", "na"),
+        }
+        cache_identifier_raw = json.dumps(cache_identifier_dict, sort_keys=True)
+        cache_identifier = hashlib.md5(cache_identifier_raw.encode("ascii")).hexdigest()
+        cache_path = os.path.join("common", "cache", self.name, f"{cache_identifier}.pkl")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        return cache_path
+
+    def _filter_multiview_samples_by_surface_distance(self, base_valid_sample_idx_list):
+        cache_path = self._build_surface_filter_cache_path()
+        threshold_m = float(self.max_hand_obj_surface_dist_mm) / 1000.0
+
+        if self.use_cache and os.path.exists(cache_path):
+            with open(cache_path, "rb") as p_f:
+                filtered_idx_list = pickle.load(p_f)
+            logger.info(
+                f"Loaded {self.name} hand-object surface filter cache from {cache_path} "
+                f"(raw={len(base_valid_sample_idx_list)}, kept={len(filtered_idx_list)}, "
+                f"dropped={len(base_valid_sample_idx_list) - len(filtered_idx_list)}, "
+                f"threshold={float(self.max_hand_obj_surface_dist_mm):.3f} mm)"
+            )
+            return filtered_idx_list
+
+        source_obj_mesh_cache = {}
+        filtered_idx_list = []
+        total = len(base_valid_sample_idx_list)
+        for order_idx, valid_idx in enumerate(base_valid_sample_idx_list):
+            multiview_id_list = self.multiview_sample_idxs[valid_idx]
+            multiview_info_list = self.multiview_sample_infos[valid_idx]
+            source_set = self.set_mappings[multiview_info_list[0]["set_name"]]
+            source_idx = multiview_id_list[0]
+
+            hand_verts = source_set.get_verts_3d(source_idx)
+            obj_id, obj_transform = source_set.get_obj_info(source_idx)
+            obj_id = int(obj_id)
+            if obj_id not in source_obj_mesh_cache:
+                obj_mesh = trimesh.load(source_set.dex_ycb.obj_file[obj_id], process=False)
+                source_obj_mesh_cache[obj_id] = np.asarray(obj_mesh.vertices, dtype=np.float32)
+            obj_verts = _transform_points(source_obj_mesh_cache[obj_id], obj_transform)
+            min_dist = _min_surface_distance_obj_to_hand(hand_verts, obj_verts)
+            if min_dist <= threshold_m:
+                filtered_idx_list.append(valid_idx)
+
+        if self.use_cache:
+            with open(cache_path, "wb") as p_f:
+                pickle.dump(filtered_idx_list, p_f)
+            logger.info(
+                f"Wrote {self.name} hand-object surface filter cache to {cache_path} "
+                f"(raw={total}, kept={len(filtered_idx_list)}, dropped={total - len(filtered_idx_list)}, "
+                f"threshold={float(self.max_hand_obj_surface_dist_mm):.3f} mm)"
+            )
+        else:
+            logger.info(
+                f"Built {self.name} hand-object surface filter "
+                f"(raw={total}, kept={len(filtered_idx_list)}, dropped={total - len(filtered_idx_list)}, "
+                f"threshold={float(self.max_hand_obj_surface_dist_mm):.3f} mm)"
+            )
+
+        return filtered_idx_list
 
     def __len__(self):
         return self.len
@@ -581,12 +738,13 @@ class DexYCBMultiView(torch.utils.data.Dataset):
             T_master_2_new_master = sample["target_cam_extr"][new_master_id]
             master_joints_3d = sample["target_joints_3d_no_rot"][new_master_id]
             master_verts_3d = sample["target_verts_3d_no_rot"][new_master_id]
+            master_obj_kp21 = sample["target_obj_kp21_no_rot"][new_master_id]
+            master_obj_kp21_rest = sample["target_obj_kp21_rest"][new_master_id]
             master_obj_sparse = sample["target_obj_sparse_no_rot"][new_master_id]
             master_obj_sparse_rest = sample["target_obj_pc_sparse_rest"][new_master_id]
             master_obj_eval_rest = sample["target_obj_pc_eval_rest"][new_master_id]
             master_obj_rot6d_label = sample["target_rot6d_label"][new_master_id]
             master_obj_t_label_rel = sample["target_t_label_rel"][new_master_id]
-            master_obj_center = sample["target_obj_center_3d_no_rot"][new_master_id]
 
         elif self.master_system == "as_constant_camera":
             new_master_serial = self.CONST_CAM_SERIAL
@@ -595,13 +753,13 @@ class DexYCBMultiView(torch.utils.data.Dataset):
             T_master_2_new_master = sample["target_cam_extr"][new_master_id]
             master_joints_3d = sample["target_joints_3d_no_rot"][new_master_id]
             master_verts_3d = sample["target_verts_3d_no_rot"][new_master_id]
+            master_obj_kp21 = sample["target_obj_kp21_no_rot"][new_master_id]
+            master_obj_kp21_rest = sample["target_obj_kp21_rest"][new_master_id]
             master_obj_sparse = sample["target_obj_sparse_no_rot"][new_master_id]
             master_obj_sparse_rest = sample["target_obj_pc_sparse_rest"][new_master_id]
             master_obj_eval_rest = sample["target_obj_pc_eval_rest"][new_master_id]
             master_obj_rot6d_label = sample["target_rot6d_label"][new_master_id]
             master_obj_t_label_rel = sample["target_t_label_rel"][new_master_id]
-            master_obj_center = sample["target_obj_center_3d_no_rot"][new_master_id]
-
         for i, T_m2c in enumerate(sample["target_cam_extr"]):
             T_new_master_2_cam = np.linalg.inv(T_master_2_new_master) @ T_m2c
             extr_prerot = sample["extr_prerot"][i]  # (3, 3)
@@ -619,13 +777,13 @@ class DexYCBMultiView(torch.utils.data.Dataset):
         sample["master_serial"] = new_master_serial
         sample["master_joints_3d"] = master_joints_3d
         sample["master_verts_3d"] = master_verts_3d
+        sample["master_obj_kp21"] = master_obj_kp21
+        sample["master_obj_kp21_rest"] = master_obj_kp21_rest
         sample["master_obj_sparse"] = master_obj_sparse
         sample["master_obj_sparse_rest"] = master_obj_sparse_rest
         sample["master_obj_eval_rest"] = master_obj_eval_rest
         sample["master_obj_rot6d_label"] = master_obj_rot6d_label
         sample["master_obj_t_label_rel"] = master_obj_t_label_rel
-        sample["master_obj_center"] = master_obj_center
-
         if "target_obj_pc_eval_rest" in sample:
             del sample["target_obj_pc_eval_rest"]
 

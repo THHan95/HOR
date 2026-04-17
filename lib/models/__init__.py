@@ -11,3 +11,4 @@ from .MVP import MVP
 from .POEM import PtEmbedMultiviewStereo
 from .HOR import POEM_RLE
 from .HOR_heatmap import POEM_Heatmap
+from .HOR_sv_tri import POEM_SV_Tri

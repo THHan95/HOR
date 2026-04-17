@@ -425,7 +425,13 @@ def main_worker(gpu_id: int, cfg: CN, arg: Namespace, time_f: float):
             _dist_barrier(arg, rank)
             base_model.on_train_finished(recorder, epoch_idx)
 
-            if (epoch_idx % arg.eval_interval == arg.eval_interval - 1 or epoch_idx == 0) and rank == 0:
+            is_final_epoch = epoch_idx == cfg["TRAIN"]["EPOCH"] - 1
+            should_validate = (
+                epoch_idx == 0
+                or epoch_idx % arg.eval_interval == arg.eval_interval - 1
+                or is_final_epoch
+            )
+            if should_validate and rank == 0:
                 logger.info("do validation and save results")
                 with torch.no_grad():
                     base_model.eval()

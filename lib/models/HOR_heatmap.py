@@ -59,8 +59,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         self.feat_dim = 512  # ResNet34 最终输出的通道数
         self.hot_dim = 384
         self.conf_heatmap_spread_tau_px = float(cfg.get("CONF_HEATMAP_SPREAD_TAU_PX", 24.0))
-        self.conf_hand_reproj_tau_px = float(cfg.get("CONF_HAND_REPROJ_TAU_PX", 12.0))
-        self.conf_obj_reproj_tau_px = float(cfg.get("CONF_OBJ_REPROJ_TAU_PX", 16.0))
 
         self.img_backbone = build_backbone(cfg.BACKBONE, data_preset=self.data_preset_cfg)
         assert self.img_backbone.name in ["resnet18", "resnet34", "resnet50"], "Wrong backbone for PETR"
@@ -111,9 +109,12 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         self.face = self.mano_decoder.face
         self.sv_obj_feat_abs_max = 1e4
         self.sv_obj_rot6d_abs_max = 10.0
+        self.sv_obj_trans_abs_max = self.data_preset_cfg.BBOX_3D_SIZE * 8.0
         self.sv_obj_global_dim = self.feat_size[0]
-        self.sv_object_rot_feat = nn.Sequential(
-            nn.Linear(self.sv_obj_global_dim, self.feat_dim),
+        self.sv_obj_local_dim = 32 * (self.num_hand_joints + self.num_obj_joints)
+        self.sv_obj_pose_input_dim = self.sv_obj_global_dim + self.sv_obj_local_dim
+        self.sv_object_pose_feat = nn.Sequential(
+            nn.Linear(self.sv_obj_pose_input_dim, self.feat_dim),
             nn.ReLU(),
             nn.Linear(self.feat_dim, self.feat_dim),
             nn.ReLU(),
@@ -123,10 +124,22 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             nn.ReLU(),
             nn.Linear(self.feat_dim // 2, 6),
         )
-        self.sv_object_rot_conf_regressor = nn.Sequential(
+        self.sv_object_trans_regressor = nn.Sequential(
             nn.Linear(self.feat_dim, self.feat_dim // 2),
             nn.ReLU(),
-            nn.Linear(self.feat_dim // 2, 1),
+            nn.Linear(self.feat_dim // 2, 3),
+        )
+        self.sv_pose_init_token_dim = self.feat_dim // 2
+        self.sv_object_init_pose_token = nn.Sequential(
+            nn.Linear(9, self.sv_pose_init_token_dim),
+            nn.ReLU(),
+            nn.Linear(self.sv_pose_init_token_dim, self.sv_pose_init_token_dim),
+            nn.ReLU(),
+        )
+        self.sv_object_init_pose_head = nn.Sequential(
+            nn.Linear(self.sv_pose_init_token_dim * 2 + 9, self.feat_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.feat_dim // 2, 9),
         )
         self.register_buffer("identity_rot6d", torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=torch.float32))
 
@@ -151,7 +164,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         self.heatmap_obj_weight = cfg.LOSS.get("HEATMAP_OBJ_N", self.heatmap_hand_weight)
         self.heatmap_hand_map_weight = cfg.LOSS.get("HEATMAP_HAND_MAP_N", 1.0)
         self.heatmap_obj_map_weight = cfg.LOSS.get("HEATMAP_OBJ_MAP_N", self.heatmap_hand_map_weight)
-        self.obj_occ_weight = cfg.LOSS.get("OBJ_OCC_N", 1.0)
         self.chamfer_loss = chamfer_distance
         self.earth_mover_loss = earth_mover_distance
         self.obj_pose_rot_weight = cfg.LOSS.get("OBJ_POSE_ROT_N", 1.0)
@@ -161,10 +173,13 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         self.obj_view_rot_weight = cfg.LOSS.get("OBJ_VIEW_ROT_N", 1.0)
         self.obj_view_rot6d_weight = cfg.LOSS.get("OBJ_VIEW_ROT6D_N", self.obj_pose_rot6d_weight)
         self.obj_pose_trans_weight = cfg.LOSS.get("OBJ_POSE_TRANS_N", 5.0)
+        self.obj_init_trans_weight = cfg.LOSS.get("OBJ_INIT_TRANS_N", self.obj_pose_trans_weight)
+        self.obj_view_trans_weight = cfg.LOSS.get("OBJ_VIEW_TRANS_N", self.obj_pose_trans_weight)
         self.obj_pose_points_weight = cfg.LOSS.get("OBJ_POSE_POINTS_N", 10.0)
         self.obj_chamfer_weight = cfg.LOSS.get("OBJ_CHAMFER_N", 5.0)
         self.obj_emd_weight = cfg.LOSS.get("OBJ_EMD_N", 1.0)
         self.obj_penetration_weight = cfg.LOSS.get("OBJ_PENETRATION_N", 5.0)
+        self.obj_direct_pose_aux_scale = float(cfg.LOSS.get("OBJ_DIRECT_POSE_AUX_SCALE", 0.1))
         self.decoder_hand_weight = cfg.LOSS.get("DECODER_HAND_N", 10.0)
         self.decoder_proj_weight = cfg.LOSS.get("DECODER_PROJ_N", 10.0)
         self.triangulation_weight = cfg.LOSS.get("TRIANGULATION_N", 10.0)
@@ -185,8 +200,10 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                 self.stage1_end_epoch + max(int(self.stage2_warmup_epochs), 0),
             )
         )
+        self.val_recon_full_only_final = bool(cfg.TRAIN.get("VAL_RECON_FULL_ONLY_FINAL", True))
         self.current_stage_name = "stage2"
         self.current_stage2_warmup = 1.0
+        self.current_val_recon_mode = "fast"
         self._debug_stage_log_state = {"train": None, "val": None}
 
         self.loss_metric = LossMetric(cfg)
@@ -205,7 +222,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         self.MPJPE_SV_3D = MeanEPE(cfg, "SV_J")
         self.MPVPE_SV_3D = MeanEPE(cfg, "SV_V")
         self.MPRPE_HAND_3D = MeanEPE(cfg, "Ref_J")
-        self.MPRPE_OBJ_3D = MeanEPE(cfg, "Ref_O")
         # self.MPJPE_3D_REF = MeanEPE(cfg, "joints_3d_ref")
         # self.MPVPE_3D = MeanEPE(cfg, "vertices_3d")
         # self.MPJPE_3D_REL = MeanEPE(cfg, "joints_3d_rel")
@@ -242,17 +258,15 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         self._set_module_requires_grad(self.feat_in, True)
         self._set_module_requires_grad(self.uv_delayer, True)
         self._set_module_requires_grad(self.uv_out, True)
-        self._set_module_requires_grad(getattr(self, "obj_occ_out", None), True)
         self._set_module_requires_grad(self.hot_pose, True)
         self._set_module_requires_grad(self.att_0, True)
         self._set_module_requires_grad(self.att_1, True)
         self._set_module_requires_grad(self.mano_fuse, True)
         self._set_module_requires_grad(self.mano_fc, True)
-        self._set_module_requires_grad(self.sv_object_rot_feat, True)
+        self._set_module_requires_grad(self.sv_object_pose_feat, True)
         self._set_module_requires_grad(self.sv_object_rot_regressor, True)
-        self._set_module_requires_grad(self.sv_object_rot_conf_regressor, True)
+        self._set_module_requires_grad(self.sv_object_trans_regressor, True)
         self._set_module_requires_grad(self.ptEmb_head, True)
-        self._set_module_requires_grad(getattr(self.ptEmb_head, "obj_pose_delta_regressor", None), False)
         self._set_module_requires_grad(getattr(self.ptEmb_head, "obj_feat_fuser", None), False)
         if hasattr(self.ptEmb_head, "center_shift_layer"):
             self._set_module_requires_grad(self.ptEmb_head.center_shift_layer, False)
@@ -270,10 +284,7 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             # Stage1 trains single-view branches + keypoint-master hand refinement,
             # but still learns per-view SV object 6D pose without HO interaction refinement.
             self._set_module_requires_grad(getattr(self.ptEmb_head, "ho_transformer", None), False)
-            self._set_module_requires_grad(getattr(self.ptEmb_head, "obj_pose_delta_regressor", None), False)
             self._set_module_requires_grad(getattr(self.ptEmb_head, "obj_feat_fuser", None), False)
-            self._set_module_requires_grad(getattr(self, "obj_occ_out", None), False)
-
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         frozen_params = sum(p.numel() for p in self.parameters() if not p.requires_grad)
         if self.debug_logs:
@@ -332,10 +343,8 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             x = de(x)
         x = F.max_pool2d(x, kernel_size=2, stride=2)
         uv_hmap = torch.sigmoid(self.uv_out(x) * 0.5)
-        obj_occ = torch.sigmoid(self.obj_occ_out(x))
         uv_hmap = torch.nan_to_num(uv_hmap, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-        obj_occ = torch.nan_to_num(obj_occ, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-        return uv_hmap, obj_occ
+        return uv_hmap
 
     def _build_heads(self):
         total_points = self.num_hand_joints + self.num_obj_joints
@@ -345,7 +354,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             ConvBlock(self.feat_size[3] + self.feat_size[2], self.feat_size[3], kernel_size=3, relu=True, norm='bn'),
         ])
         self.uv_out = ConvBlock(self.feat_size[3], total_points, kernel_size=1, padding=0, relu=False, norm=None)
-        self.obj_occ_out = ConvBlock(self.feat_size[3], 1, kernel_size=1, padding=0, relu=False, norm=None)
         self.fc_layers = []
 
     def _resolve_stage(self, epoch_idx):
@@ -368,13 +376,26 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
     @staticmethod
     def _stage_display_name(stage_name, short=False):
         if stage_name == "stage1":
-            return "S1 Hand+ObjCenter" if short else "stage1_hand_obj_center"
+            return "S1 Hand+SVObjPose" if short else "stage1_hand_sv_obj_pose"
         if stage_name == "stage2":
             return "S2 HO-Pose" if short else "stage2_ho_pose"
         return stage_name
 
     def _stage_tb_prefix(self, mode, stage_name):
         return f"img/{mode}_{self._stage_display_name(stage_name, short=False)}"
+
+    def _use_full_val_recon(self, epoch_idx):
+        if not self.val_recon_full_only_final:
+            return True
+        total_epochs = int(self.train_cfg.get("EPOCH", 1))
+        return epoch_idx >= max(total_epochs - 1, 0)
+
+    @staticmethod
+    def _pose_metrics_for_logging(pose_metric_dict):
+        return pose_metric_dict
+
+    def _log_sv_view_debug_scalars(self, preds, batch, step_idx, suffix=""):
+        return
 
     @staticmethod
     def _loss_dict_is_finite(loss_dict):
@@ -430,7 +451,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             f"image={tuple(batch['image'].shape)} "
             f"master_obj_sparse_rest={tuple(batch['master_obj_sparse_rest'].shape) if 'master_obj_sparse_rest' in batch else None} "
             f"ref_hand={tuple(preds['ref_hand'].shape) if 'ref_hand' in preds else None} "
-            f"ref_obj={tuple(preds['ref_obj'].shape) if 'ref_obj' in preds else None} "
             f"mano_sv={tuple(preds['mano_3d_mesh_sv'].shape) if 'mano_3d_mesh_sv' in preds else None} "
             f"mano_master={tuple(preds['mano_3d_mesh_master'].shape) if 'mano_3d_mesh_master' in preds else None} "
             f"hand_states={_shape(hand_states)} "
@@ -465,11 +485,9 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         logger.warning(
             f"[{mode}][StageDebugLoss] epoch={epoch_idx} stage={self._stage_display_name(stage_name, short=True)} "
             f"loss={(_to_float('loss') or 0.0):.4f} "
-            f"hm={((_to_float('loss_heatmap_hand') or 0.0) + (_to_float('loss_heatmap_obj') or 0.0) + (_to_float('loss_heatmap_hand_map') or 0.0) + (_to_float('loss_heatmap_obj_map') or 0.0)):.4f} "
-            f"occ={(_to_float('loss_obj_occ') or 0.0):.4f} "
+            f"hm={((_to_float('loss_heatmap_hand') or 0.0) + (_to_float('loss_heatmap_hand_map') or 0.0)):.4f} "
             f"triang={(_to_float('loss_triang') or 0.0):.4f} "
             f"triang_h={(_to_float('loss_triang_hand') or 0.0):.4f} "
-            f"triang_o={(_to_float('loss_triang_obj') or 0.0):.4f} "
             f"j3d={(_to_float('loss_3d_jts') or 0.0):.4f} "
             f"proj2d={(_to_float('loss_2d_proj') or 0.0):.4f} "
             f"mano_proj={(_to_float('loss_mano_proj') or 0.0):.4f} "
@@ -490,7 +508,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             "metric_obj_rot_deg": zero,
             "metric_obj_trans_l1": zero,
             "metric_obj_trans_epe": zero,
-            "metric_obj_center_epe": zero,
             "metric_obj_add": zero,
             "metric_obj_adds": zero,
             "metric_sv_obj_rot_l1": zero,
@@ -549,18 +566,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         return conf
 
     @staticmethod
-    def _reprojection_confidence(points_master, pred_uv_pixel, K, T_c2m, tau_px=12.0):
-        n_views = pred_uv_pixel.shape[1]
-        points_mv = points_master.unsqueeze(1).expand(-1, n_views, -1, -1)
-        points_cam = batch_cam_extr_transf(T_c2m, points_mv)
-        proj_uv = batch_cam_intr_projection(K, points_cam)
-        reproj_err = torch.linalg.norm(proj_uv - pred_uv_pixel, dim=-1)
-        valid = (points_cam[..., 2] > 1e-6) & torch.isfinite(proj_uv).all(dim=-1) & torch.isfinite(pred_uv_pixel).all(dim=-1)
-        conf = torch.exp(-reproj_err / max(float(tau_px), 1e-6)) * valid.to(dtype=reproj_err.dtype)
-        conf = torch.nan_to_num(conf, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-        return conf.unsqueeze(-1)
-
-    @staticmethod
     def _fit_ortho_camera(points_xy, points_uv, visibility=None, eps=1e-6):
         points_xy = torch.nan_to_num(points_xy, nan=0.0, posinf=0.0, neginf=0.0)
         points_uv = torch.nan_to_num(points_uv, nan=0.0, posinf=0.0, neginf=0.0)
@@ -603,29 +608,27 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         projected = rot6d_to_rotmat(matrix_f[..., :3, :2].reshape(*matrix_f.shape[:-2], 6))
         return projected.to(dtype=orig_dtype)
 
-    def _predict_singleview_object_rotation(
+    def _predict_singleview_object_pose(
         self,
         global_feat,
         hand_obj_fused_flat,
-        obj_center_query_2d,
-        obj_center_point,
         cam_extr,
         master_id,
-        obj_view_conf=None,
-        obj_view_conf_xy=None,
     ):
-        batch_size, num_cams = obj_center_query_2d.shape[:2]
-        # Ablation path: isolate the SV rotation branch from the hand-object fused
-        # token feature and only use the backbone global image descriptor.
-        shared_input = global_feat.float()
+        batch_size, num_cams = cam_extr.shape[:2]
+        shared_input = torch.cat((global_feat.float(), hand_obj_fused_flat.float()), dim=-1)
         shared_input = self._sanitize_obj_tensor(shared_input, self.sv_obj_feat_abs_max)
-        shared_feat = self.sv_object_rot_feat(shared_input)
+        shared_feat = self.sv_object_pose_feat(shared_input)
         shared_feat = self._sanitize_obj_tensor(shared_feat, self.sv_obj_feat_abs_max)
 
         pred_rot6d_cam = self._sanitize_obj_tensor(
             self.sv_object_rot_regressor(shared_feat),
             self.sv_obj_rot6d_abs_max,
         ).view(batch_size, num_cams, 6)
+        pred_trans_cam = self._sanitize_obj_tensor(
+            self.sv_object_trans_regressor(shared_feat),
+            self.sv_obj_trans_abs_max,
+        ).view(batch_size, num_cams, 3)
         pred_rotmat_cam = rot6d_to_rotmat(pred_rot6d_cam.reshape(-1, 6)).view(batch_size, num_cams, 3, 3)
 
         cam_to_master = cam_extr[..., :3, :3]
@@ -635,46 +638,44 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             rotmat_to_rot6d(pred_rotmat_master.reshape(-1, 3, 3)).view(batch_size, num_cams, 6),
             self.sv_obj_rot6d_abs_max,
         )
+        pred_trans_master = torch.matmul(cam_to_master, pred_trans_cam.unsqueeze(-1)).squeeze(-1)
+        pred_trans_master = self._sanitize_obj_tensor(pred_trans_master, self.sv_obj_trans_abs_max)
 
-        learned_view_conf = torch.sigmoid(self.sv_object_rot_conf_regressor(shared_feat)).view(batch_size, num_cams)
-        learned_view_conf = torch.nan_to_num(learned_view_conf, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-        if obj_view_conf_xy is not None:
-            base_view_conf = torch.sqrt(torch.prod(obj_view_conf_xy.detach().clamp(min=1e-6), dim=-1)).mean(dim=-1)
-        elif obj_view_conf is not None:
-            base_view_conf = obj_view_conf.detach().mean(dim=-1)
-        else:
-            base_view_conf = learned_view_conf.new_ones(batch_size, num_cams)
+        pose_master = torch.cat((pred_rot6d_master.detach(), pred_trans_master.detach()), dim=-1)
+        pose_master = self._sanitize_obj_tensor(pose_master, self.sv_obj_feat_abs_max)
+        pose_tokens = self.sv_object_init_pose_token(pose_master.reshape(-1, 9)).view(batch_size, num_cams, -1)
+        pose_tokens = self._sanitize_obj_tensor(pose_tokens, self.sv_obj_feat_abs_max)
+        pose_mean = pose_tokens.mean(dim=1)
+        pose_max = pose_tokens.max(dim=1).values
 
-        center_query = obj_center_query_2d.mean(dim=2)
-        in_frame = (
-            (center_query[..., 0] >= -1.0)
-            & (center_query[..., 0] <= 1.0)
-            & (center_query[..., 1] >= -1.0)
-            & (center_query[..., 1] <= 1.0)
-        ).to(dtype=learned_view_conf.dtype)
-        obj_center_mv = obj_center_point.unsqueeze(1).repeat(1, num_cams, 1, 1)
-        obj_center_cam = batch_cam_extr_transf(torch.linalg.inv(cam_extr), obj_center_mv)
-        in_front = (obj_center_cam[..., 2] > 1e-6).to(dtype=learned_view_conf.dtype).squeeze(-1)
-        valid_mask = in_frame * in_front * (base_view_conf > 1e-6).to(dtype=learned_view_conf.dtype)
+        pred_rotmat_master = rot6d_to_rotmat(pred_rot6d_master.detach().reshape(-1, 6)).view(batch_size, num_cams, 3, 3)
+        base_rotmat = self._project_matrix_to_rotation(pred_rotmat_master.mean(dim=1))
+        base_rot6d = self._sanitize_obj_tensor(rotmat_to_rot6d(base_rotmat), self.sv_obj_rot6d_abs_max)
+        base_trans = self._sanitize_obj_tensor(pred_trans_master.detach().mean(dim=1), self.sv_obj_trans_abs_max)
 
-        raw_view_weights = learned_view_conf * base_view_conf * valid_mask
-        fallback = (raw_view_weights.sum(dim=1, keepdim=True) <= 1e-6).to(dtype=raw_view_weights.dtype)
-        norm_view_weights = raw_view_weights + fallback * raw_view_weights.new_full((batch_size, num_cams), 1.0 / float(num_cams))
-        norm_view_weights = norm_view_weights / (norm_view_weights.sum(dim=1, keepdim=True) + 1e-6)
+        init_input = torch.cat((pose_mean, pose_max, base_rot6d, base_trans), dim=-1)
+        init_input = self._sanitize_obj_tensor(init_input, self.sv_obj_feat_abs_max)
+        init_delta = self.sv_object_init_pose_head(init_input)
+        init_delta = self._sanitize_obj_tensor(init_delta, self.sv_obj_feat_abs_max)
+        delta_rot = torch.tanh(init_delta[:, :6]) * 0.5
+        delta_trans = torch.tanh(init_delta[:, 6:]) * self.data_preset_cfg.BBOX_3D_SIZE
 
-        master_id = torch.as_tensor(master_id, device=pred_rot6d_master.device, dtype=torch.long)
-        batch_idx = torch.arange(batch_size, device=pred_rot6d_master.device)
-        master_rot6d = pred_rot6d_master[batch_idx, master_id]
-        master_rot6d = self._sanitize_obj_tensor(master_rot6d, self.sv_obj_rot6d_abs_max)
+        fused_rot_seed = self._sanitize_obj_tensor(base_rot6d + delta_rot, self.sv_obj_rot6d_abs_max)
+        fused_rot6d = self._sanitize_obj_tensor(
+            rotmat_to_rot6d(rot6d_to_rotmat(fused_rot_seed)),
+            self.sv_obj_rot6d_abs_max,
+        )
+        fused_trans = self._sanitize_obj_tensor(base_trans + delta_trans, self.sv_obj_trans_abs_max)
 
         return {
             "obj_view_rot6d_cam": pred_rot6d_cam,
             "obj_view_rot6d_master": pred_rot6d_master,
-            "obj_view_rot_conf": learned_view_conf,
-            "obj_view_rot_weights": norm_view_weights,
-            "obj_view_rot_valid": valid_mask,
-            "obj_fused_rot6d_sv": master_rot6d,
-            "obj_init_rot6d": master_rot6d,
+            "obj_view_trans": pred_trans_cam,
+            "obj_view_trans_master": pred_trans_master,
+            "obj_fused_rot6d_sv": fused_rot6d,
+            "obj_fused_trans_sv": fused_trans,
+            "obj_init_rot6d": fused_rot6d,
+            "obj_init_trans": fused_trans,
         }
 
     @staticmethod
@@ -730,18 +731,13 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         pred_mano_cam_sv = preds.get("mano_cam_sv", None)
 
         pred_ref_joints_2d = preds["pred_hand"].view(batch_size, n_views, self.num_hand_joints, 2)
-        pred_ref_center_2d = preds["pred_obj"].view(batch_size, n_views, 1, 2)
         pred_hand_conf = preds["conf_hand"].view(batch_size, n_views, self.num_hand_joints, -1).mean(dim=-1)
-        pred_obj_conf = preds["conf_obj"].view(batch_size, n_views, self.num_obj_joints, -1).mean(dim=-1)
 
         gt_joints_2d = self._normed_uv_to_pixel(batch["target_joints_uvd"][..., :2], (img_h, img_w))
         gt_verts_2d_persp = self._normed_uv_to_pixel(batch["target_verts_uvd"][..., :2], (img_h, img_w))
-        gt_obj_center_2d = self._normed_uv_to_pixel(batch["target_obj_center_uv"], (img_h, img_w))
-        gt_hand_root_2d = gt_joints_2d[:, :, self.center_idx:self.center_idx + 1]
         pred_sv_joints_2d = self._normed_uv_to_pixel(pred_mano_2d_joints_sv, (img_h, img_w))
         pred_sv_verts_2d = self._normed_uv_to_pixel(pred_mano_2d_verts_sv, (img_h, img_w))
         pred_ref_joints_2d = self._normed_uv_to_pixel(pred_ref_joints_2d, (img_h, img_w))
-        pred_ref_center_2d = self._normed_uv_to_pixel(pred_ref_center_2d, (img_h, img_w))
 
         pred_kp_master_mesh = preds.get("mano_3d_mesh_kp_master", None)
         if pred_kp_master_mesh is not None:
@@ -752,57 +748,24 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             pred_kp_master_joints_2d = None
             pred_kp_master_verts_2d = None
 
-        pred_obj_center = preds["obj_center_xyz_master"][-1]
         pred_obj_sparse = preds["obj_xyz_master"][-1]
-        _, pred_obj_center_2d_proj = self._project_master_points(pred_obj_center, T_c2m_gt, K_gt)
         _, pred_obj_sparse_2d_proj = self._project_master_points(pred_obj_sparse, T_c2m_gt, K_gt)
 
         gt_obj_sparse = batch["master_obj_sparse"]
         _, gt_obj_sparse_2d_proj = self._project_master_points(gt_obj_sparse, T_c2m_gt, K_gt)
 
-        gt_sv_ortho_cam = None
-        gt_joints_2d_sv = None
-        gt_verts_2d_sv = None
-        gt_obj_sparse_2d_sv = None
-        gt_obj_center_2d_sv = None
-        gt_hand_joints_rel = batch.get("target_joints_3d_rel", None)
-        gt_hand_verts_rel = batch.get("target_verts_3d_rel", None)
-        gt_hand_joints_vis = batch.get("target_joints_vis", None)
         gt_obj_sparse_cam = batch.get("target_obj_pc_sparse", None)
-        gt_hand_joints_cam = batch.get("target_joints_3d", None)
-        gt_obj_t_rel = batch.get("target_t_label_rel", None)
-        if gt_hand_joints_rel is None and gt_hand_joints_cam is not None:
-            gt_hand_root_cam = gt_hand_joints_cam[:, :, self.center_idx:self.center_idx + 1]
-            gt_hand_joints_rel = gt_hand_joints_cam - gt_hand_root_cam
-        if gt_hand_joints_rel is not None:
-            gt_sv_ortho_cam = self._fit_ortho_camera(
-                gt_hand_joints_rel[..., :2],
-                gt_joints_2d,
-                visibility=gt_hand_joints_vis,
-            )
-        if gt_sv_ortho_cam is not None and gt_hand_joints_rel is not None:
-            gt_joints_2d_sv = self._ortho_project_points(gt_hand_joints_rel, gt_sv_ortho_cam)
-        if gt_sv_ortho_cam is not None and gt_hand_verts_rel is not None:
-            gt_verts_2d_sv = self._ortho_project_points(gt_hand_verts_rel, gt_sv_ortho_cam)
-        if gt_sv_ortho_cam is not None and gt_obj_sparse_cam is not None and gt_hand_joints_cam is not None:
-            gt_hand_root_cam = gt_hand_joints_cam[:, :, self.center_idx:self.center_idx + 1]
-            gt_obj_sparse_rel = gt_obj_sparse_cam - gt_hand_root_cam
-            gt_obj_sparse_2d_sv = self._ortho_project_points(gt_obj_sparse_rel, gt_sv_ortho_cam)
-            gt_obj_center_rel = gt_obj_sparse_rel.mean(dim=-2, keepdim=True)
-            gt_obj_center_2d_sv = self._ortho_project_points(gt_obj_center_rel, gt_sv_ortho_cam)
-        if gt_sv_ortho_cam is not None and gt_obj_t_rel is not None:
-            gt_obj_center_rel = gt_obj_t_rel.unsqueeze(-2).to(dtype=gt_sv_ortho_cam.dtype)
-            gt_obj_center_2d_sv = self._ortho_project_points(gt_obj_center_rel, gt_sv_ortho_cam)
 
         pred_sv_obj_sparse_2d = None
-        pred_sv_obj_center_2d = None
-        if preds.get("obj_view_rot6d_cam", None) is not None and pred_mano_cam_sv is not None:
+        pred_obj_view_trans_mm = None
+        pred_obj_view_rot_deg = None
+        if preds.get("obj_view_rot6d_cam", None) is not None and preds.get("obj_view_trans", None) is not None and pred_mano_cam_sv is not None:
             obj_template = batch["master_obj_sparse_rest"].to(device=pred_mano_2d_mesh_sv.device, dtype=pred_mano_2d_mesh_sv.dtype)
             obj_template = obj_template.unsqueeze(1).expand(-1, n_views, -1, -1)
             pred_obj_rotmat_sv = rot6d_to_rotmat(
                 preds["obj_view_rot6d_cam"].reshape(-1, 6)
             ).view(batch_size, n_views, 3, 3).to(dtype=obj_template.dtype)
-            pred_sv_obj_xyz = torch.matmul(obj_template, pred_obj_rotmat_sv.transpose(-1, -2))
+            pred_sv_obj_xyz = torch.matmul(obj_template, pred_obj_rotmat_sv.transpose(-1, -2)) + preds["obj_view_trans"].unsqueeze(-2).to(dtype=obj_template.dtype)
             pred_mano_cam_sv = pred_mano_cam_sv.view(batch_size, n_views, 3).to(dtype=pred_sv_obj_xyz.dtype)
             pred_sv_obj_sparse_2d = orthgonalProj(
                 pred_sv_obj_xyz[..., :2].clone(),
@@ -810,60 +773,87 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                 torch.zeros_like(pred_mano_cam_sv[..., 1:]).unsqueeze(-2),
                 img_size=img_w,
             )
-            pred_sv_obj_center_2d = pred_ref_center_2d.clone()
-            pred_sv_obj_sparse_center_2d = pred_sv_obj_sparse_2d.mean(dim=-2, keepdim=True)
-            pred_sv_obj_sparse_2d = pred_sv_obj_sparse_2d + (pred_sv_obj_center_2d - pred_sv_obj_sparse_center_2d)
             pred_sv_obj_sparse_2d = torch.nan_to_num(pred_sv_obj_sparse_2d, nan=0.0, posinf=max(img_h, img_w), neginf=0.0)
-            pred_sv_obj_center_2d = torch.nan_to_num(pred_sv_obj_center_2d, nan=0.0, posinf=max(img_h, img_w), neginf=0.0)
 
         img_views = img[batch_id]
         gt_joints_2d_views = gt_joints_2d[batch_id]
         pred_sv_joints_2d_views = pred_sv_joints_2d[batch_id]
         pred_sv_verts_2d_views = pred_sv_verts_2d[batch_id]
         pred_ref_joints_2d_views = pred_ref_joints_2d[batch_id]
-        pred_ref_center_2d_views = pred_ref_center_2d[batch_id]
         pred_hand_conf_views = pred_hand_conf[batch_id]
-        pred_obj_conf_views = pred_obj_conf[batch_id]
-        pred_obj_view_rot_conf = preds.get("obj_view_rot_conf", None)
-        pred_obj_view_rot_weights = preds.get("obj_view_rot_weights", None)
-        pred_obj_view_rot_valid = preds.get("obj_view_rot_valid", None)
-        pred_obj_view_rot_deg = None
         master_view_mask = torch.zeros(n_views, 1, dtype=img.dtype, device=img.device)
         master_view_mask[batch["master_id"][batch_id].item(), 0] = 1.0
-        best_view_mask = None
-        if pred_obj_view_rot_weights is not None:
-            best_view_mask = torch.zeros(n_views, 1, dtype=img.dtype, device=img.device)
-            best_view_idx = torch.argmax(pred_obj_view_rot_weights[batch_id]).item()
-            best_view_mask[best_view_idx, 0] = 1.0
         if preds.get("obj_view_rot6d_cam", None) is not None and batch.get("target_rot6d_label", None) is not None:
             gt_view_rot6d = batch["target_rot6d_label"][batch_id]
             pred_view_rot6d = preds["obj_view_rot6d_cam"][batch_id]
             pred_obj_view_rot_deg = torch.rad2deg(
                 self.rotation_geodesic(pred_view_rot6d, gt_view_rot6d)
             ).unsqueeze(-1)
+        if preds.get("obj_view_trans", None) is not None and batch.get("target_t_label_rel", None) is not None:
+            pred_obj_view_trans_mm = torch.linalg.norm(
+                preds["obj_view_trans"][batch_id] - batch["target_t_label_rel"][batch_id].to(device=preds["obj_view_trans"].device, dtype=preds["obj_view_trans"].dtype),
+                dim=-1,
+            ).unsqueeze(-1) * 1000.0
+        pred_obj_master_rot_deg = None
+        pred_obj_master_trans_mm = None
+        if preds.get("obj_rot6d", None) is not None and batch.get("master_obj_rot6d_label", None) is not None:
+            pred_obj_master_rot_deg = torch.rad2deg(
+                self.rotation_geodesic(
+                    preds["obj_rot6d"][-1][batch_id:batch_id + 1],
+                    batch["master_obj_rot6d_label"][batch_id:batch_id + 1],
+                )
+            ).unsqueeze(-1).repeat(n_views, 1)
+        if preds.get("obj_trans", None) is not None and batch.get("master_obj_t_label_rel", None) is not None:
+            pred_obj_master_trans_mm = torch.linalg.norm(
+                preds["obj_trans"][-1][batch_id] - batch["master_obj_t_label_rel"][batch_id].to(device=preds["obj_trans"][-1].device, dtype=preds["obj_trans"][-1].dtype),
+                dim=-1,
+            ).unsqueeze(-1).repeat(n_views, 1) * 1000.0
+        pred_obj_init_sparse_2d_views = None
+        pred_obj_init_rot_deg = None
+        pred_obj_init_trans_mm = None
+        if stage_name == "stage2" and preds.get("obj_init_rot6d", None) is not None and preds.get("obj_init_trans", None) is not None:
+            obj_template_master = batch["master_obj_sparse_rest"].to(device=pred_mano_2d_mesh_sv.device, dtype=pred_mano_2d_mesh_sv.dtype)
+            hand_master_mesh = preds.get("mano_3d_mesh_kp_master", None)
+            if hand_master_mesh is None:
+                hand_master_mesh = preds["mano_3d_mesh_master"]
+            hand_master_root = hand_master_mesh[:, self.num_hand_verts + self.center_idx:self.num_hand_verts + self.center_idx + 1]
+            pred_obj_init_xyz = self._build_object_points_from_hand_pose(
+                obj_template_master,
+                preds["obj_init_rot6d"],
+                hand_master_root,
+                preds["obj_init_trans"],
+            )
+            _, pred_obj_init_sparse_2d = self._project_master_points(pred_obj_init_xyz, T_c2m_gt, K_gt)
+            pred_obj_init_sparse_2d_views = pred_obj_init_sparse_2d[batch_id]
+            if batch.get("master_obj_rot6d_label", None) is not None:
+                pred_obj_init_rot_deg = torch.rad2deg(
+                    self.rotation_geodesic(
+                        preds["obj_init_rot6d"][batch_id:batch_id + 1],
+                        batch["master_obj_rot6d_label"][batch_id:batch_id + 1],
+                    )
+                ).unsqueeze(-1).repeat(n_views, 1)
+            if batch.get("master_obj_t_label_rel", None) is not None:
+                pred_obj_init_trans_mm = torch.linalg.norm(
+                    preds["obj_init_trans"][batch_id] - batch["master_obj_t_label_rel"][batch_id].to(device=preds["obj_init_trans"].device, dtype=preds["obj_init_trans"].dtype),
+                    dim=-1,
+                ).unsqueeze(-1).repeat(n_views, 1) * 1000.0
         pred_kp_master_joints_2d_views = pred_kp_master_joints_2d[batch_id] if pred_kp_master_joints_2d is not None else None
         pred_kp_master_verts_2d_views = pred_kp_master_verts_2d[batch_id] if pred_kp_master_verts_2d is not None else None
-        pred_obj_center_2d_views = pred_obj_center_2d_proj[batch_id]
         pred_obj_sparse_2d_views = pred_obj_sparse_2d_proj[batch_id]
         pred_sv_obj_sparse_2d_views = pred_sv_obj_sparse_2d[batch_id] if pred_sv_obj_sparse_2d is not None else None
-        pred_sv_obj_center_2d_views = pred_sv_obj_center_2d[batch_id] if pred_sv_obj_center_2d is not None else None
         gt_obj_sparse_2d_views = batch_cam_intr_projection(K_gt, gt_obj_sparse_cam)[batch_id] if gt_obj_sparse_cam is not None else gt_obj_sparse_2d_proj[batch_id]
-        gt_obj_sparse_2d_sv_views = gt_obj_sparse_2d_views
-        gt_obj_center_2d_sv_views = gt_obj_center_2d[batch_id]
-        gt_joints_2d_sv_views = gt_joints_2d_sv[batch_id] if gt_joints_2d_sv is not None else gt_joints_2d_views
-        gt_verts_2d_sv_views = gt_verts_2d_sv[batch_id] if gt_verts_2d_sv is not None else gt_verts_2d_persp[batch_id]
+        gt_joints_2d_sv_views = gt_joints_2d_views
         gt_verts_2d_views = gt_verts_2d_persp[batch_id]
+        gt_verts_2d_sv_views = gt_verts_2d_views
 
         tag_prefix = self._stage_tb_prefix(mode, stage_name)
         self.summary.add_image(
-            f"{tag_prefix}/hand_objcenter_confidence_2d",
+            f"{tag_prefix}/hand_confidence_2d",
             tile_batch_images(
                 draw_batch_joint_confidence_images(
                     pred_ref_joints_2d_views,
                     pred_hand_conf_views,
                     img_views,
-                    obj_center2d=pred_ref_center_2d_views,
-                    obj_conf=pred_obj_conf_views,
                     n_sample=n_views,
                 )
             ),
@@ -898,7 +888,7 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             step_idx,
             dataformats="HWC",
         )
-        if pred_sv_obj_sparse_2d_views is not None and pred_sv_obj_center_2d_views is not None:
+        if pred_sv_obj_sparse_2d_views is not None:
             self.summary.add_image(
                 f"{tag_prefix}/sv_hand_obj_pose_2d",
                 tile_batch_images(
@@ -906,14 +896,14 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                         gt_verts2d=gt_verts_2d_views,
                         pred_verts2d=pred_sv_verts_2d_views,
                         face=self.face,
-                        gt_obj2d=gt_obj_sparse_2d_sv_views,
+                        gt_obj2d=gt_obj_sparse_2d_views,
                         pred_obj2d=pred_sv_obj_sparse_2d_views,
-                        gt_objc2d=gt_obj_center_2d_sv_views,
-                        pred_objc2d=pred_sv_obj_center_2d_views,
+                        gt_objc2d=None,
+                        pred_objc2d=None,
                         intr=K_gt[batch_id],
                         tensor_image=img_views,
-                        pred_obj_conf=pred_obj_conf_views,
-                        pred_obj_error=pred_obj_view_rot_deg if pred_obj_view_rot_deg is not None else None,
+                        pred_obj_rot_error=pred_obj_view_rot_deg,
+                        pred_obj_trans_error=pred_obj_view_trans_mm,
                         n_sample=n_views,
                     )
                 ),
@@ -953,26 +943,29 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             )
 
         if stage_name == "stage2":
-            if pred_obj_view_rot_conf is not None and pred_obj_view_rot_weights is not None:
+            final_hand_verts_2d_views = pred_kp_master_verts_2d_views if pred_kp_master_verts_2d_views is not None else pred_sv_verts_2d_views
+            if pred_obj_init_sparse_2d_views is not None:
                 self.summary.add_image(
-                    f"{tag_prefix}/rotation_views_2d",
+                    f"{tag_prefix}/init_mesh_obj_2d",
                     tile_batch_images(
-                        draw_batch_obj_view_rotation_images(
-                            img_views,
-                            pred_obj_view_rot_conf[batch_id].unsqueeze(-1),
-                            pred_obj_view_rot_weights[batch_id].unsqueeze(-1),
-                            rot_deg=pred_obj_view_rot_deg,
-                            valid_mask=pred_obj_view_rot_valid[batch_id].unsqueeze(-1) if pred_obj_view_rot_valid is not None else None,
-                            obj_center2d=pred_ref_center_2d_views,
-                            is_master=master_view_mask,
-                            is_best=best_view_mask,
+                        draw_batch_mesh_images_pred(
+                            gt_verts2d=gt_verts_2d_views,
+                            pred_verts2d=final_hand_verts_2d_views,
+                            face=self.face,
+                            gt_obj2d=gt_obj_sparse_2d_views,
+                            pred_obj2d=pred_obj_init_sparse_2d_views,
+                            gt_objc2d=None,
+                            pred_objc2d=None,
+                            intr=K_gt[batch_id],
+                            tensor_image=img_views,
+                            pred_obj_rot_error=pred_obj_init_rot_deg,
+                            pred_obj_trans_error=pred_obj_init_trans_mm,
                             n_sample=n_views,
                         )
                     ),
                     step_idx,
                     dataformats="HWC",
                 )
-            final_hand_verts_2d_views = pred_kp_master_verts_2d_views if pred_kp_master_verts_2d_views is not None else pred_sv_verts_2d_views
             self.summary.add_image(
                 f"{tag_prefix}/final_mesh_obj_2d",
                 tile_batch_images(
@@ -982,11 +975,12 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                         face=self.face,
                         gt_obj2d=gt_obj_sparse_2d_views,
                         pred_obj2d=pred_obj_sparse_2d_views,
-                        gt_objc2d=gt_obj_center_2d[batch_id],
-                        pred_objc2d=pred_obj_center_2d_views,
+                        gt_objc2d=None,
+                        pred_objc2d=None,
                         intr=K_gt[batch_id],
                         tensor_image=img_views,
-                        pred_obj_conf=pred_obj_conf_views,
+                        pred_obj_rot_error=pred_obj_master_rot_deg,
+                        pred_obj_trans_error=pred_obj_master_trans_mm,
                         n_sample=n_views,
                     )
                 ),
@@ -1011,7 +1005,7 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         mlvl_feat = mlvl_feat.view(batch_size, num_cams, *mlvl_feat.shape[1:])  # (B, N, 128, 32, 32)
         mlvl_feat = torch.nan_to_num(mlvl_feat, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        uv_hmap, obj_occ_map = self.heatmap_decode(img_feats)  # (B*N, J_hand + J_obj, 32, 32), (B*N, 1, 32, 32)
+        uv_hmap = self.heatmap_decode(img_feats)  # (B*N, J_hand + J_obj, 32, 32)
         uv_peak_conf = self._heatmap_peak_confidence(uv_hmap)
         uv_pdf = uv_hmap.reshape(*uv_hmap.shape[:2], -1)
         uv_pdf = uv_pdf / (uv_pdf.sum(dim=-1, keepdim=True) + 1e-6)
@@ -1058,31 +1052,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         coord_xyz_sv, coord_uv_sv, pose_euler_sv, shape_sv, cam_sv = self.mano_decoder(pred_hand_pose, pred_shape, pred_cam)
         coord_xyz_sv = coord_xyz_sv * (self.data_preset_cfg.BBOX_3D_SIZE / 2)
 
-        if num_cams > 1:
-            hand_score_ref = hand_score.detach()
-            obj_score_ref = obj_score.detach()
-            ref_hand_init, ref_obj_init = self.project(
-                pred_hand_jts, pred_obj_jts, hand_score_ref, obj_score_ref, K, T_c2m, batch_size, num_cams
-            )
-            hand_reproj_conf = self._reprojection_confidence(
-                ref_hand_init.detach(),
-                pred_hand_jts_pixel.view(batch_size, num_cams, self.num_hand_joints, 2),
-                K,
-                T_c2m,
-                tau_px=self.conf_hand_reproj_tau_px,
-            ).flatten(0, 1).expand(-1, -1, 2)
-            obj_reproj_conf = self._reprojection_confidence(
-                ref_obj_init.detach(),
-                pred_obj_jts_pixel.view(batch_size, num_cams, self.num_obj_joints, 2),
-                K,
-                T_c2m,
-                tau_px=self.conf_obj_reproj_tau_px,
-            ).flatten(0, 1).expand(-1, -1, 2)
-            hand_score = torch.nan_to_num(hand_score * hand_reproj_conf, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-            obj_score = torch.nan_to_num(obj_score * obj_reproj_conf, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-            uv_reproj_conf = torch.cat((hand_reproj_conf, obj_reproj_conf), dim=1)
-        else:
-            uv_reproj_conf = torch.ones_like(uv_conf_base_xy)
         uv_conf = torch.cat((hand_score, obj_score), dim=1)
 
         sv_preds = {
@@ -1092,11 +1061,8 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             "pred_obj_pixel": pred_obj_jts_pixel,
             "pred_uv_heatmap": uv_hmap,
             "pred_uv_conf_base": uv_conf_base_xy,
-            "pred_uv_conf_reproj": uv_reproj_conf,
             "pred_uv_conf": uv_conf,
-            "pred_obj_occ": obj_occ_map,
             "conf_hand": hand_score,
-            "conf_obj": obj_score,
             "mano_3d_mesh_sv": coord_xyz_sv,
             "mano_2d_mesh_sv": coord_uv_sv,
             "mano_pose_euler_sv": pose_euler_sv,
@@ -1115,25 +1081,19 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
 
         hand_score_ref = hand_score.detach()
         obj_score_ref = obj_score.detach()
-        ref_hand, ref_obj = self.project(pred_hand_jts, pred_obj_jts, hand_score_ref, obj_score_ref, K, T_c2m, batch_size, num_cams)  # (B, J_hand, 3), (B, J_obj, 3)
+        ref_hand, _ = self.project(pred_hand_jts, pred_obj_jts, hand_score_ref, obj_score_ref, K, T_c2m, batch_size, num_cams)
         ref_hand_anchor = ref_hand.detach()
-        ref_obj_anchor = ref_obj.detach()
         sv_rot_outputs = None
         if interaction_mode in ["hand", "ho"]:
-            sv_rot_outputs = self._predict_singleview_object_rotation(
+            sv_rot_outputs = self._predict_singleview_object_pose(
                 global_feat=global_feat,
                 hand_obj_fused_flat=hand_obj_fused_flat,
-                obj_center_query_2d=pred_obj_jts.detach().view(batch_size, num_cams, self.num_obj_joints, 2),
-                obj_center_point=ref_obj_anchor,
                 cam_extr=batch["target_cam_extr"],
                 master_id=batch["master_id"],
-                obj_view_conf=obj_score_ref.mean(dim=-1).view(batch_size, num_cams, self.num_obj_joints),
-                obj_view_conf_xy=obj_score_ref.view(batch_size, num_cams, self.num_obj_joints, 2),
             )
 
         proj_preds = {
             "ref_hand": ref_hand,
-            "ref_obj": ref_obj,
         }
         # prepare image_metas
         img_metas = {
@@ -1150,15 +1110,12 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             mano_3d_sv = coord_xyz_sv,
             img_metas=img_metas,
             reference_hand=ref_hand_anchor,
-            reference_obj=ref_obj_anchor,
+            reference_obj=None,
             obj_template=batch["master_obj_sparse_rest"],
             hand_view_conf=hand_score_ref.mean(dim=-1).view(batch_size, num_cams, self.num_hand_joints),
-            obj_view_conf=obj_score_ref.mean(dim=-1).view(batch_size, num_cams, self.num_obj_joints),
-            obj_view_conf_xy=obj_score_ref.view(batch_size, num_cams, self.num_obj_joints, 2),
-            obj_occ_map=obj_occ_map.view(batch_size, num_cams, 1, *obj_occ_map.shape[-2:]),
-            obj_center_query_2d=pred_obj_jts.detach().view(batch_size * num_cams, self.num_obj_joints, 1, 2),
             sv_rot_outputs=sv_rot_outputs,
             obj_init_rot6d=sv_rot_outputs["obj_init_rot6d"] if sv_rot_outputs is not None else None,
+            obj_init_trans=sv_rot_outputs["obj_init_trans"] if sv_rot_outputs is not None else None,
             interaction_mode=interaction_mode,
             stage2_warmup=self.current_stage2_warmup,
             # **extra_kwargs,
@@ -1194,32 +1151,34 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         obj_fused_rot6d_sv = pt_preds.get("obj_fused_rot6d_sv", None)
         obj_view_rot6d_cam = pt_preds.get("obj_view_rot6d_cam", None)
         obj_view_rot6d_master = pt_preds.get("obj_view_rot6d_master", None)
-        obj_view_rot_conf = pt_preds.get("obj_view_rot_conf", None)
-        obj_view_rot_weights = pt_preds.get("obj_view_rot_weights", None)
-        obj_view_rot_valid = pt_preds.get("obj_view_rot_valid", None)
+        obj_view_trans = pt_preds.get("obj_view_trans", None)
+        obj_view_trans_master = pt_preds.get("obj_view_trans_master", None)
+        obj_init_trans = pt_preds.get("obj_init_trans", None)
+        obj_fused_trans_sv = pt_preds.get("obj_fused_trans_sv", None)
         if sv_rot_outputs is not None:
             obj_init_rot6d = sv_rot_outputs.get("obj_init_rot6d", obj_init_rot6d)
             obj_fused_rot6d_sv = sv_rot_outputs.get("obj_fused_rot6d_sv", obj_fused_rot6d_sv)
             obj_view_rot6d_cam = sv_rot_outputs.get("obj_view_rot6d_cam", obj_view_rot6d_cam)
             obj_view_rot6d_master = sv_rot_outputs.get("obj_view_rot6d_master", obj_view_rot6d_master)
-            obj_view_rot_conf = sv_rot_outputs.get("obj_view_rot_conf", obj_view_rot_conf)
-            obj_view_rot_weights = sv_rot_outputs.get("obj_view_rot_weights", obj_view_rot_weights)
-            obj_view_rot_valid = sv_rot_outputs.get("obj_view_rot_valid", obj_view_rot_valid)
+            obj_view_trans = sv_rot_outputs.get("obj_view_trans", obj_view_trans)
+            obj_view_trans_master = sv_rot_outputs.get("obj_view_trans_master", obj_view_trans_master)
+            obj_init_trans = sv_rot_outputs.get("obj_init_trans", obj_init_trans)
+            obj_fused_trans_sv = sv_rot_outputs.get("obj_fused_trans_sv", obj_fused_trans_sv)
         
         # 3. 提取并重命名 pt_preds 中的关键信息放入最终字典
         final_preds.update({
             "hand_mesh_xyz_master": pt_preds["all_hand_mesh_xyz_master"],
             "obj_xyz_master": pt_preds["all_obj_xyz_master"],
-            "obj_center_xyz_master": pt_preds["all_obj_center_xyz_master"],
             "obj_rot6d": pt_preds["all_obj_rot6d"],
             "obj_trans": pt_preds["all_obj_trans"],
             "obj_init_rot6d": obj_init_rot6d,
+            "obj_init_trans": obj_init_trans,
             "obj_fused_rot6d_sv": obj_fused_rot6d_sv,
+            "obj_fused_trans_sv": obj_fused_trans_sv,
             "obj_view_rot6d_cam": obj_view_rot6d_cam,
             "obj_view_rot6d_master": obj_view_rot6d_master,
-            "obj_view_rot_conf": obj_view_rot_conf,
-            "obj_view_rot_weights": obj_view_rot_weights,
-            "obj_view_rot_valid": obj_view_rot_valid,
+            "obj_view_trans": obj_view_trans,
+            "obj_view_trans_master": obj_view_trans_master,
             "mano_3d_mesh_master": pt_preds["pred_kp_mano_mesh_xyz_master"],
             "mano_3d_mesh_kp_master": pt_preds["pred_kp_mano_mesh_xyz_master"],
             "mano_3d_mesh_mesh_master": None,
@@ -1258,11 +1217,9 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
     def compute_object_pose_metrics(preds, gt):
         pred_obj_rot6d = torch.nan_to_num(preds["obj_rot6d"][-1].detach(), nan=0.0, posinf=10.0, neginf=-10.0)
         pred_obj_trans = torch.nan_to_num(preds["obj_trans"][-1].detach(), nan=0.0, posinf=10.0, neginf=-10.0)
-        pred_obj_center = torch.nan_to_num(preds["obj_center_xyz_master"][-1].detach().squeeze(1), nan=0.0, posinf=10.0, neginf=-10.0)
 
         gt_obj_rot6d = torch.nan_to_num(gt["master_obj_rot6d_label"].detach(), nan=0.0, posinf=10.0, neginf=-10.0)
         gt_obj_trans = torch.nan_to_num(gt["master_obj_t_label_rel"].detach(), nan=0.0, posinf=10.0, neginf=-10.0)
-        gt_obj_center = torch.nan_to_num(gt["master_obj_center"].detach().squeeze(1), nan=0.0, posinf=10.0, neginf=-10.0)
 
         pred_rotmat = rot6d_to_rotmat(pred_obj_rot6d)
         gt_rotmat = rot6d_to_rotmat(gt_obj_rot6d)
@@ -1276,7 +1233,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             "metric_obj_rot_deg": torch.mean(rot_angle_deg),
             "metric_obj_trans_l1": torch.mean(torch.abs(pred_obj_trans - gt_obj_trans)),
             "metric_obj_trans_epe": torch.mean(torch.norm(pred_obj_trans - gt_obj_trans, dim=-1)),
-            "metric_obj_center_epe": torch.mean(torch.norm(pred_obj_center - gt_obj_center, dim=-1)),
         }
         obj_points_rest = torch.nan_to_num(
             gt["master_obj_sparse_rest"].detach(),
@@ -1298,15 +1254,21 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
 
     def compute_sv_object_pose_metrics(self, preds, gt):
         pred_obj_view_rot6d_cam = preds.get("obj_view_rot6d_cam", None)
+        pred_obj_view_trans = preds.get("obj_view_trans", None)
         target_obj_rot6d_gt = gt.get("target_rot6d_label", None)
-        if pred_obj_view_rot6d_cam is None or target_obj_rot6d_gt is None:
+        target_obj_trans_gt = gt.get("target_t_label_rel", None)
+        if pred_obj_view_rot6d_cam is None or target_obj_rot6d_gt is None or pred_obj_view_trans is None or target_obj_trans_gt is None:
             return {
                 "metric_sv_obj_rot_l1": preds["mano_3d_mesh_sv"].new_tensor(0.0),
                 "metric_sv_obj_rot_deg": preds["mano_3d_mesh_sv"].new_tensor(0.0),
+                "metric_sv_obj_trans_l1": preds["mano_3d_mesh_sv"].new_tensor(0.0),
+                "metric_sv_obj_trans_epe": preds["mano_3d_mesh_sv"].new_tensor(0.0),
             }
 
         pred_obj_view_rot6d_cam = torch.nan_to_num(pred_obj_view_rot6d_cam.detach(), nan=0.0, posinf=10.0, neginf=-10.0)
+        pred_obj_view_trans = torch.nan_to_num(pred_obj_view_trans.detach(), nan=0.0, posinf=10.0, neginf=-10.0)
         target_obj_rot6d_gt = torch.nan_to_num(target_obj_rot6d_gt.detach(), nan=0.0, posinf=10.0, neginf=-10.0)
+        target_obj_trans_gt = torch.nan_to_num(target_obj_trans_gt.detach(), nan=0.0, posinf=10.0, neginf=-10.0)
         rot_deg = torch.rad2deg(
             self.rotation_geodesic(
                 pred_obj_view_rot6d_cam.reshape(-1, 6),
@@ -1314,19 +1276,16 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             )
         ).view(pred_obj_view_rot6d_cam.shape[0], pred_obj_view_rot6d_cam.shape[1])
         rot_l1 = torch.abs(pred_obj_view_rot6d_cam - target_obj_rot6d_gt).mean(dim=-1)
+        trans_l1 = torch.abs(pred_obj_view_trans - target_obj_trans_gt).mean(dim=-1)
+        trans_epe = torch.linalg.norm(pred_obj_view_trans - target_obj_trans_gt, dim=-1)
 
         valid_weight = torch.ones_like(rot_deg)
-        pred_obj_view_rot_valid = preds.get("obj_view_rot_valid", None)
-        if pred_obj_view_rot_valid is not None:
-            valid_weight = valid_weight * pred_obj_view_rot_valid.detach().to(dtype=rot_deg.dtype, device=rot_deg.device)
-        obj_center_vis = gt.get("target_obj_center_vis", None)
-        if obj_center_vis is not None:
-            valid_weight = valid_weight * obj_center_vis.view(rot_deg.shape[0], rot_deg.shape[1]).to(dtype=rot_deg.dtype, device=rot_deg.device)
-
         denom = valid_weight.sum() + 1e-6
         return {
             "metric_sv_obj_rot_l1": (rot_l1 * valid_weight).sum() / denom,
             "metric_sv_obj_rot_deg": (rot_deg * valid_weight).sum() / denom,
+            "metric_sv_obj_trans_l1": (trans_l1 * valid_weight).sum() / denom,
+            "metric_sv_obj_trans_epe": (trans_epe * valid_weight).sum() / denom,
         }
 
     @staticmethod
@@ -1360,9 +1319,10 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         pred_obj_rot6d = preds["obj_rot6d"]  # (N_preds, B, 6)
         pred_obj_trans = preds["obj_trans"]  # (N_preds, B, 3)
         pred_obj_init_rot6d = preds.get("obj_init_rot6d", None)
+        pred_obj_init_trans = preds.get("obj_init_trans", None)
         pred_obj_view_rot6d_cam = preds.get("obj_view_rot6d_cam", None)
         pred_obj_view_rot6d_master = preds.get("obj_view_rot6d_master", None)
-        pred_obj_view_rot_valid = preds.get("obj_view_rot_valid", None)
+        pred_obj_view_trans = preds.get("obj_view_trans", None)
         pred_pose_sv = preds["mano_pose_euler_sv"]  # (BN, 48)
         pred_shape_sv = preds["mano_shape_sv"]  # (BN, 10)
         pred_pose_kp_master = preds["pred_kp_pose"]  # (B, 48)
@@ -1385,15 +1345,13 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         gt_T_c2m = torch.linalg.inv(gt["target_cam_extr"])  # (B, N, 4, 4)
         gt_K = gt["target_cam_intr"]  # (B, N, 3, 3)
         target_obj_rot6d_gt = gt.get("target_rot6d_label", None)
+        target_obj_trans_gt = gt.get("target_t_label_rel", None)
         gt_hand_joints_rel = gt.get("target_joints_3d_rel", None)
         joints_vis_mv = gt.get("target_joints_vis", None)
         joints_vis = gt.get("target_joints_vis", None)
         joints_vis = joints_vis.flatten(0, 1) if joints_vis is not None else None  # (B*N, 21)
-        obj_center_vis = gt.get("target_obj_center_vis", None)
-        obj_center_vis = obj_center_vis.flatten(0, 1) if obj_center_vis is not None else None  # (B*N, 1)
         enable_hand_refine = stage_name in ["stage1", "stage2"]
-        enable_object_center_prior = stage_name in ["stage1", "stage2"]
-        enable_object_occ = stage_name == "stage2"
+        enable_object_center_prior = False
         enable_sv_object_rotation = stage_name in ["stage1", "stage2"]
         enable_master_object_rotation = stage_name == "stage2"
         enable_object_refine = stage_name == "stage2"
@@ -1406,6 +1364,7 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         obj_warmup = self._stage2_object_warmup(epoch_idx, stage_name) if epoch_idx is not None else float(enable_object_refine)
         master_obj_rot_geo_weight = self.obj_view_rot_weight if enable_master_object_rotation else self.obj_pose_rot_weight
         master_obj_rot_l1_weight = self.obj_view_rot6d_weight if enable_master_object_rotation else self.obj_pose_rot6d_weight
+        direct_pose_aux_scale = self.obj_direct_pose_aux_scale
 
         loss_dict = {}
 
@@ -1465,87 +1424,45 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         else:
             loss_heatmap_hand_map = pred_jts_2d.new_tensor(0.0)
 
-        if enable_object_center_prior and obj_center_vis is not None:
-            pred_obj_pixel = preds["pred_obj_pixel"].view(batch_size, n_views, self.num_obj_joints, 2)
-            gt_obj_pixel = self._normed_uv_to_pixel(gt["target_obj_center_uv"], (H, W))
-            gt_obj_pixel_finite = torch.isfinite(gt_obj_pixel).all(dim=-1)
-            gt_obj_pixel = torch.nan_to_num(gt_obj_pixel, nan=0.0, posinf=img_scale, neginf=-img_scale)
-            obj_heatmap_diff = (pred_obj_pixel - gt_obj_pixel) / img_scale
-            obj_heatmap_diff = torch.sum(torch.pow(obj_heatmap_diff, 2), dim=3)
-            obj_valid_mask = obj_center_vis.view(batch_size, n_views, self.num_obj_joints) * gt_obj_pixel_finite.to(dtype=obj_heatmap_diff.dtype)
-            obj_heatmap_diff = obj_heatmap_diff * obj_valid_mask
-            obj_valid = obj_valid_mask.sum()
-            loss_heatmap_obj = obj_heatmap_diff.sum() / (obj_valid + 1e-9)
-        else:
-            loss_heatmap_obj = pred_jts_2d.new_tensor(0.0)
-
-        pred_obj_heatmap = pred_uv_heatmap[:, self.num_hand_joints:]
-        gt_obj_heatmap = gt.get("target_obj_center_heatmap", None)
-        if enable_object_center_prior and gt_obj_heatmap is not None and obj_center_vis is not None:
-            gt_obj_heatmap = gt_obj_heatmap.flatten(0, 1).to(dtype=pred_obj_heatmap.dtype, device=pred_obj_heatmap.device)
-            loss_heatmap_obj_map = self._masked_heatmap_mse(pred_obj_heatmap, gt_obj_heatmap, obj_center_vis)
-        else:
-            loss_heatmap_obj_map = pred_jts_2d.new_tensor(0.0)
-
-        pred_obj_occ = preds.get("pred_obj_occ", None)
-        gt_obj_occ = gt.get("target_obj_occupancy", None)
-        if enable_object_occ and pred_obj_occ is not None and gt_obj_occ is not None:
-            pred_obj_occ = torch.nan_to_num(pred_obj_occ, nan=0.0, posinf=1.0, neginf=0.0)
-            gt_obj_occ = gt_obj_occ.flatten(0, 1).to(dtype=pred_obj_occ.dtype, device=pred_obj_occ.device)
-            occ_valid = torch.isfinite(gt_obj_occ).to(dtype=pred_obj_occ.dtype)
-            gt_obj_occ = torch.nan_to_num(gt_obj_occ, nan=0.0, posinf=1.0, neginf=0.0)
-            loss_obj_occ = ((pred_obj_occ - gt_obj_occ).pow(2) * occ_valid).sum() / (occ_valid.sum() + 1e-9)
-        else:
-            loss_obj_occ = pred_jts_2d.new_tensor(0.0)
-
-        obj_prior_warmup = obj_warmup if stage_name == "stage2" else 1.0
         loss_heatmap_hand = loss_heatmap_hand * self.heatmap_hand_weight
-        loss_heatmap_obj = loss_heatmap_obj * self.heatmap_obj_weight * obj_prior_warmup
         loss_heatmap_hand_map = loss_heatmap_hand_map * self.heatmap_hand_map_weight
-        loss_heatmap_obj_map = loss_heatmap_obj_map * self.heatmap_obj_map_weight * obj_prior_warmup
-        loss_obj_occ = loss_obj_occ * self.obj_occ_weight * obj_prior_warmup
 
         loss_dict.update({
             'loss_2d_sv': loss_hand_2d_sv,
             'loss_heatmap_hand': loss_heatmap_hand,
-            'loss_heatmap_obj': loss_heatmap_obj,
             'loss_heatmap_hand_map': loss_heatmap_hand_map,
-            'loss_heatmap_obj_map': loss_heatmap_obj_map,
-            'loss_obj_occ': loss_obj_occ,
         })
+        obj_prior_warmup = obj_warmup if stage_name == "stage2" else 1.0
 
         # ====================================================================
         # 2. Triangulation Loss (多视角几何收敛先验)
         # ====================================================================
         loss_triang_hand = self.criterion_joints(preds["ref_hand"], master_hand_joints_gt) * self.triangulation_hand_weight
-        if enable_object_center_prior:
-            loss_triang_obj = self.criterion_joints(preds["ref_obj"], gt["master_obj_center"]) * self.triangulation_obj_weight * obj_prior_warmup
-        else:
-            loss_triang_obj = loss_triang_hand.new_tensor(0.0)
-        loss_triang_total = loss_triang_hand + loss_triang_obj
+        loss_triang_total = loss_triang_hand
         
         loss_dict['loss_triang_hand'] = loss_triang_hand
-        loss_dict['loss_triang_obj'] = loss_triang_obj
         loss_dict['loss_triang'] = loss_triang_total
 
         if enable_master_object_rotation and pred_obj_init_rot6d is not None:
             pred_obj_init_rot6d = torch.nan_to_num(pred_obj_init_rot6d, nan=0.0, posinf=10.0, neginf=-10.0)
             master_obj_rot6d_gt = torch.nan_to_num(master_obj_rot6d_gt, nan=0.0, posinf=10.0, neginf=-10.0)
-            loss_obj_init_rot_geo = torch.mean(self.rotation_geodesic(pred_obj_init_rot6d, master_obj_rot6d_gt)) * self.obj_init_rot_weight * obj_prior_warmup
-            loss_obj_init_rot_l1 = self.coord_loss(pred_obj_init_rot6d, master_obj_rot6d_gt) * self.obj_init_rot6d_weight * obj_prior_warmup
+            loss_obj_init_rot_geo = torch.mean(self.rotation_geodesic(pred_obj_init_rot6d, master_obj_rot6d_gt)) * self.obj_init_rot_weight * obj_prior_warmup * direct_pose_aux_scale
+            loss_obj_init_rot_l1 = self.coord_loss(pred_obj_init_rot6d, master_obj_rot6d_gt) * self.obj_init_rot6d_weight * obj_prior_warmup * direct_pose_aux_scale
         else:
             loss_obj_init_rot_geo = pred_mano_3d_mesh_sv.new_tensor(0.0)
             loss_obj_init_rot_l1 = pred_mano_3d_mesh_sv.new_tensor(0.0)
         loss_obj_init_rot = loss_obj_init_rot_geo + loss_obj_init_rot_l1
+        if enable_master_object_rotation and pred_obj_init_trans is not None:
+            pred_obj_init_trans = torch.nan_to_num(pred_obj_init_trans, nan=0.0, posinf=10.0, neginf=-10.0)
+            master_obj_trans_gt = torch.nan_to_num(master_obj_trans_gt, nan=0.0, posinf=10.0, neginf=-10.0)
+            loss_obj_init_trans = self.coord_loss(pred_obj_init_trans, master_obj_trans_gt) * self.obj_init_trans_weight * obj_prior_warmup * direct_pose_aux_scale
+        else:
+            loss_obj_init_trans = pred_mano_3d_mesh_sv.new_tensor(0.0)
 
         if enable_sv_object_rotation and pred_obj_view_rot6d_cam is not None:
             pred_obj_view_rot6d_cam = torch.nan_to_num(pred_obj_view_rot6d_cam, nan=0.0, posinf=10.0, neginf=-10.0)
-            if pred_obj_view_rot_valid is not None:
-                valid_view_weight = pred_obj_view_rot_valid.to(dtype=pred_obj_view_rot6d_cam.dtype, device=pred_obj_view_rot6d_cam.device)
-            else:
-                valid_view_weight = torch.ones(batch_size, n_views, dtype=pred_obj_view_rot6d_cam.dtype, device=pred_obj_view_rot6d_cam.device)
-            if obj_center_vis is not None:
-                valid_view_weight = valid_view_weight * obj_center_vis.view(batch_size, n_views)
+            pred_obj_view_trans = torch.nan_to_num(pred_obj_view_trans, nan=0.0, posinf=10.0, neginf=-10.0) if pred_obj_view_trans is not None else None
+            valid_view_weight = torch.ones(batch_size, n_views, dtype=pred_obj_view_rot6d_cam.dtype, device=pred_obj_view_rot6d_cam.device)
 
             if target_obj_rot6d_gt is not None:
                 target_obj_rot6d_gt = torch.nan_to_num(target_obj_rot6d_gt, nan=0.0, posinf=10.0, neginf=-10.0)
@@ -1556,13 +1473,31 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                 view_rot_l1_gt = torch.abs(pred_obj_view_rot6d_cam - target_obj_rot6d_gt).mean(dim=-1)
                 loss_obj_view_rot_geo = (
                     (view_rot_geo_gt * valid_view_weight).sum() / (valid_view_weight.sum() + 1e-6)
-                ) * self.obj_view_rot_weight * obj_prior_warmup
+                ) * self.obj_view_rot_weight * obj_prior_warmup * direct_pose_aux_scale
                 loss_obj_view_rot_l1 = (
                     (view_rot_l1_gt * valid_view_weight).sum() / (valid_view_weight.sum() + 1e-6)
-                ) * self.obj_view_rot6d_weight * obj_prior_warmup
+                ) * self.obj_view_rot6d_weight * obj_prior_warmup * direct_pose_aux_scale
             else:
                 loss_obj_view_rot_geo = pred_mano_3d_mesh_sv.new_tensor(0.0)
                 loss_obj_view_rot_l1 = pred_mano_3d_mesh_sv.new_tensor(0.0)
+            if pred_obj_view_trans is not None and target_obj_trans_gt is not None:
+                target_obj_trans_gt = torch.nan_to_num(target_obj_trans_gt, nan=0.0, posinf=10.0, neginf=-10.0)
+                view_trans_l1 = torch.abs(pred_obj_view_trans - target_obj_trans_gt).mean(dim=-1)
+                loss_obj_view_trans = (
+                    (view_trans_l1 * valid_view_weight).sum() / (valid_view_weight.sum() + 1e-6)
+                ) * self.obj_view_trans_weight * obj_prior_warmup * direct_pose_aux_scale
+            else:
+                loss_obj_view_trans = pred_mano_3d_mesh_sv.new_tensor(0.0)
+            if pred_obj_view_trans is not None and gt.get("target_obj_pc_sparse", None) is not None:
+                pred_sv_obj_points = self._build_object_points_from_hand_pose(
+                    gt["master_obj_sparse_rest"],
+                    pred_obj_view_rot6d_cam,
+                    gt["target_joints_3d"][:, :, self.center_idx:self.center_idx + 1],
+                    pred_obj_view_trans,
+                )
+                loss_obj_view_points = self.coord_loss(pred_sv_obj_points, gt["target_obj_pc_sparse"]) * self.obj_pose_points_weight * obj_prior_warmup
+            else:
+                loss_obj_view_points = pred_mano_3d_mesh_sv.new_tensor(0.0)
 
             if enable_sv_self_distill:
                 final_master_rot6d = torch.nan_to_num(pred_obj_rot6d[-1].detach(), nan=0.0, posinf=10.0, neginf=-10.0)
@@ -1578,31 +1513,38 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                 view_rot_l1_self = torch.abs(pred_obj_view_rot6d_cam - distilled_view_rot6d).mean(dim=-1)
                 loss_obj_view_rot_self_geo = (
                     (view_rot_geo_self * valid_view_weight).sum() / (valid_view_weight.sum() + 1e-6)
-                ) * self.obj_view_rot_weight * obj_prior_warmup
+                ) * self.obj_view_rot_weight * obj_prior_warmup * direct_pose_aux_scale
                 loss_obj_view_rot_self_l1 = (
                     (view_rot_l1_self * valid_view_weight).sum() / (valid_view_weight.sum() + 1e-6)
-                ) * self.obj_view_rot6d_weight * obj_prior_warmup
+                ) * self.obj_view_rot6d_weight * obj_prior_warmup * direct_pose_aux_scale
             else:
                 loss_obj_view_rot_self_geo = pred_mano_3d_mesh_sv.new_tensor(0.0)
                 loss_obj_view_rot_self_l1 = pred_mano_3d_mesh_sv.new_tensor(0.0)
         else:
             loss_obj_view_rot_geo = pred_mano_3d_mesh_sv.new_tensor(0.0)
             loss_obj_view_rot_l1 = pred_mano_3d_mesh_sv.new_tensor(0.0)
+            loss_obj_view_trans = pred_mano_3d_mesh_sv.new_tensor(0.0)
+            loss_obj_view_points = pred_mano_3d_mesh_sv.new_tensor(0.0)
             loss_obj_view_rot_self_geo = pred_mano_3d_mesh_sv.new_tensor(0.0)
             loss_obj_view_rot_self_l1 = pred_mano_3d_mesh_sv.new_tensor(0.0)
         loss_obj_view_rot = (
             loss_obj_view_rot_geo
             + loss_obj_view_rot_l1
+            + loss_obj_view_trans
+            + loss_obj_view_points
             + loss_obj_view_rot_self_geo
             + loss_obj_view_rot_self_l1
         )
 
+        loss_dict['loss_obj_init_trans'] = loss_obj_init_trans
         loss_dict['loss_obj_init_rot'] = loss_obj_init_rot
         loss_dict['loss_obj_init_rot_geo'] = loss_obj_init_rot_geo
         loss_dict['loss_obj_init_rot_l1'] = loss_obj_init_rot_l1
         loss_dict['loss_obj_view_rot'] = loss_obj_view_rot
         loss_dict['loss_obj_view_rot_geo'] = loss_obj_view_rot_geo
         loss_dict['loss_obj_view_rot_l1'] = loss_obj_view_rot_l1
+        loss_dict['loss_obj_view_trans'] = loss_obj_view_trans
+        loss_dict['loss_obj_view_points'] = loss_obj_view_points
         loss_dict['loss_obj_view_rot_self_geo'] = loss_obj_view_rot_self_geo
         loss_dict['loss_obj_view_rot_self_l1'] = loss_obj_view_rot_self_l1
 
@@ -1712,10 +1654,10 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                 master_obj_rot6d_gt = torch.nan_to_num(master_obj_rot6d_gt, nan=0.0, posinf=10.0, neginf=-10.0)
                 master_obj_trans_gt = torch.nan_to_num(master_obj_trans_gt, nan=0.0, posinf=10.0, neginf=-10.0)
                 master_obj_sparse_gt = torch.nan_to_num(master_obj_sparse_gt, nan=0.0, posinf=self.data_preset_cfg.BBOX_3D_SIZE * 8.0, neginf=-self.data_preset_cfg.BBOX_3D_SIZE * 8.0)
-                loss_obj_rot_geo = torch.mean(self.rotation_geodesic(pred_obj_rot6d_i, master_obj_rot6d_gt)) * master_obj_rot_geo_weight * obj_warmup
-                loss_obj_rot_l1 = self.coord_loss(pred_obj_rot6d_i, master_obj_rot6d_gt) * master_obj_rot_l1_weight * obj_warmup
+                loss_obj_rot_geo = torch.mean(self.rotation_geodesic(pred_obj_rot6d_i, master_obj_rot6d_gt)) * master_obj_rot_geo_weight * obj_warmup * direct_pose_aux_scale
+                loss_obj_rot_l1 = self.coord_loss(pred_obj_rot6d_i, master_obj_rot6d_gt) * master_obj_rot_l1_weight * obj_warmup * direct_pose_aux_scale
                 loss_obj_rot = loss_obj_rot_geo + loss_obj_rot_l1
-                loss_obj_trans = self.coord_loss(pred_obj_trans_i, master_obj_trans_gt) * self.obj_pose_trans_weight * obj_warmup
+                loss_obj_trans = self.coord_loss(pred_obj_trans_i, master_obj_trans_gt) * self.obj_pose_trans_weight * obj_warmup * direct_pose_aux_scale
                 loss_obj_points = self.coord_loss(pred_obj_points_i, master_obj_sparse_gt) * self.obj_pose_points_weight * obj_warmup
                 loss_obj_pose = loss_obj_rot + loss_obj_trans + loss_obj_points
 
@@ -1783,12 +1725,10 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         total_loss = (
             loss_hand_2d_sv
             + loss_heatmap_hand
-            + loss_heatmap_obj
             + loss_heatmap_hand_map
-            + loss_heatmap_obj_map
-            + loss_obj_occ
             + loss_triang_total
             + loss_obj_init_rot
+            + loss_obj_init_trans
             + loss_obj_view_rot
             + loss_mano_consistency
             + loss_pose_reg
@@ -1832,11 +1772,9 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         # GT 数据
         joints_2d_gt = batch["target_joints_uvd"][:, :, :, :2]  # (B, N, 21, 2)
         verts_2d_gt = batch["target_verts_uvd"][:, :, :, :2]  # (B, N, 778, 2)
-        obj_2d_center_gt = batch["target_obj_center_uv"]  # (B, N, 1, 2)
         joints_3d_master_gt = batch["master_joints_3d"]  # (B, 21, 3)
         verts_3d_master_gt = batch["master_verts_3d"]    # (B, 778, 3)
         obj_sparse_3d_master_gt = batch["master_obj_sparse"]  # (B, 2048, 3)
-        obj_center_3d_master_gt = batch["master_obj_center"]  # (B, 1, 3)
         verts_3d_gt = batch["target_verts_3d"]  # (B, N, 778, 3)
         joints_3d_rel_gt = batch["target_joints_3d_rel"].flatten(0, 1)  # (B*N, 21, 3)
         verts_3d_rel_gt = batch["target_verts_3d_rel"].flatten(0, 1)    # (B*N, 778, 3)
@@ -1845,7 +1783,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         
         # 为了兼容性，使用 .get() 
         obj_pc_sparse = batch.get('target_obj_pc_sparse', None)
-        obj_pc_center = batch.get('target_obj_center_3d', None)
         
         # 计算损失
         loss, loss_dict = self.compute_loss(preds, batch, stage_name=stage_name, epoch_idx=epoch_idx)
@@ -1853,6 +1790,8 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         sv_obj_metric_dict = self.compute_sv_object_pose_metrics(preds, batch) if stage_name in ["stage1", "stage2"] else {
             "metric_sv_obj_rot_l1": img.new_tensor(0.0),
             "metric_sv_obj_rot_deg": img.new_tensor(0.0),
+            "metric_sv_obj_trans_l1": img.new_tensor(0.0),
+            "metric_sv_obj_trans_epe": img.new_tensor(0.0),
         }
         loss_is_finite = self._loss_dict_is_finite(loss_dict)
         pose_metrics_finite = self._metric_dict_is_finite({**pose_metric_dict, **sv_obj_metric_dict})
@@ -1883,11 +1822,7 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         # pred_hand_joints_3d = preds["hand_mesh_xyz"][:, self.num_hand_verts:] # (B, 21, 3)
         
         pred_ref_hand_joints_3d = preds["ref_hand"]  # (B, 21, 3)
-        pred_ref_obj_joints_3d = preds["ref_obj"]    # (B, 1, 3)
         pred_obj_sparse_3d = preds["obj_xyz_master"][-1]    # (B, 2048, 3)
-        pred_obj_center_3d = preds["obj_center_xyz_master"][-1]  # (B, 1, 3)
-        pred_ref_joints_2d = preds["pred_hand"].view(batch_size, n_views, self.num_hand_joints, 2)  # (B, N, 21, 2)
-        pred_obj_center_2d = preds["pred_obj"].view(batch_size, n_views, 1, 2)  # (B, N, 1, 2)
         
         self.MPJPE_SV_3D.feed(pred_mano_3d_joints_sv, gt_kp=joints_3d_rel_gt)
         self.MPVPE_SV_3D.feed(pred_mano_3d_verts_sv, gt_kp=verts_3d_rel_gt)
@@ -1900,27 +1835,26 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             self.MPJPE_MESH_MASTER_3D.feed(pred_mano_3d_mesh_mesh_master[:, self.num_hand_verts:], gt_kp=joints_3d_master_gt)
             self.MPVPE_MESH_MASTER_3D.feed(pred_mano_3d_mesh_mesh_master[:, :self.num_hand_verts], gt_kp=verts_3d_master_gt)
         self.MPRPE_HAND_3D.feed(pred_ref_hand_joints_3d, gt_kp=joints_3d_master_gt)
-        self.MPRPE_OBJ_3D.feed(pred_ref_obj_joints_3d, gt_kp=obj_center_3d_master_gt)
         self.OBJ_RECON_MASTER.feed(pred_obj_sparse_3d, obj_sparse_3d_master_gt)
-        if obj_pc_sparse is not None and preds.get("obj_view_rot6d_cam", None) is not None:
-            pred_ref_obj_cam = batch_cam_extr_transf(
-                torch.linalg.inv(batch["target_cam_extr"]),
-                preds["ref_obj"].unsqueeze(1).repeat(1, n_views, 1, 1),
-            )
-            pred_sv_obj_sparse_3d = self._build_object_points_from_pose(
+        if obj_pc_sparse is not None and preds.get("obj_view_rot6d_cam", None) is not None and preds.get("obj_view_trans", None) is not None:
+            pred_sv_obj_sparse_3d = self._build_object_points_from_hand_pose(
                 batch["master_obj_sparse_rest"],
                 preds["obj_view_rot6d_cam"],
-                pred_ref_obj_cam,
+                batch["target_joints_3d"][:, :, self.center_idx:self.center_idx + 1],
+                preds["obj_view_trans"],
             )
             self.OBJ_RECON_SV.feed(pred_sv_obj_sparse_3d.flatten(0, 1), obj_pc_sparse.flatten(0, 1))
-        self.loss_metric.feed({**loss_dict, **pose_metric_dict, **sv_obj_metric_dict}, batch_size)
-        self._maybe_log_stage_transition_loss("train", epoch_idx, stage_name, loss_dict, {**pose_metric_dict, **sv_obj_metric_dict})
+        pose_metric_log_dict = self._pose_metrics_for_logging(pose_metric_dict)
+        metric_log_dict = {**pose_metric_log_dict, **sv_obj_metric_dict}
+        self.loss_metric.feed({**loss_dict, **metric_log_dict}, batch_size)
+        self._maybe_log_stage_transition_loss("train", epoch_idx, stage_name, loss_dict, metric_log_dict)
 
         if step_idx % self.train_log_interval == 0:
             for k, v in loss_dict.items():
                 self.summary.add_scalar(f"{k}", v.item(), step_idx)
-            for k, v in {**pose_metric_dict, **sv_obj_metric_dict}.items():
+            for k, v in metric_log_dict.items():
                 self.summary.add_scalar(k, v.item(), step_idx)
+            self._log_sv_view_debug_scalars(preds, batch, step_idx)
             self.summary.add_scalar("MPJPE_SV_3D", self.MPJPE_SV_3D.get_result(), step_idx)
             self.summary.add_scalar("MPVPE_SV_3D", self.MPVPE_SV_3D.get_result(), step_idx)
             self.summary.add_scalar("MPJPE_MASTER_3D", self.MPJPE_MASTER_3D.get_result(), step_idx)
@@ -1930,7 +1864,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             self.summary.add_scalar("MPJPE_MESH_MASTER_3D", self.MPJPE_MESH_MASTER_3D.get_result(), step_idx)
             self.summary.add_scalar("MPVPE_MESH_MASTER_3D", self.MPVPE_MESH_MASTER_3D.get_result(), step_idx)
             self.summary.add_scalar("MPRPE_HAND_3D", self.MPRPE_HAND_3D.get_result(), step_idx)
-            self.summary.add_scalar("MPRPE_OBJ_3D", self.MPRPE_OBJ_3D.get_result(), step_idx)
             self.summary.add_scalar("OBJREC_MASTER_CD", self.OBJ_RECON_MASTER.cd.avg, step_idx)
             self.summary.add_scalar("OBJREC_MASTER_FS_5", self.OBJ_RECON_MASTER.fs_5.avg, step_idx)
             self.summary.add_scalar("OBJREC_MASTER_FS_10", self.OBJ_RECON_MASTER.fs_10.avg, step_idx)
@@ -1957,7 +1890,7 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             self.MPJPE_MASTER_3D, self.MPVPE_MASTER_3D,
             self.MPJPE_KP_MASTER_3D, self.MPVPE_KP_MASTER_3D,
             self.MPJPE_MESH_MASTER_3D, self.MPVPE_MESH_MASTER_3D,
-            self.MPRPE_HAND_3D, self.MPRPE_OBJ_3D,
+            self.MPRPE_HAND_3D,
             self.OBJ_RECON_SV, self.OBJ_RECON_MASTER,
         ], epoch_idx, comment=comment)
         self.loss_metric.reset()
@@ -1970,7 +1903,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         self.MPJPE_MESH_MASTER_3D.reset()
         self.MPVPE_MESH_MASTER_3D.reset()
         self.MPRPE_HAND_3D.reset()
-        self.MPRPE_OBJ_3D.reset()
         self.OBJ_RECON_SV.reset()
         self.OBJ_RECON_MASTER.reset()
 
@@ -1984,22 +1916,24 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         interaction_mode = self._stage_to_interaction_mode(stage_name)
         self.current_stage_name = stage_name
         self.current_stage2_warmup = self._stage2_object_warmup(epoch_idx, stage_name)
+        use_full_recon_eval = self._use_full_val_recon(epoch_idx)
+        self.current_val_recon_mode = "full" if use_full_recon_eval else "fast"
         preds = self._forward_impl(batch, interaction_mode=interaction_mode)
         self._maybe_log_stage_transition("val", epoch_idx, stage_name, preds, batch)
         pose_metric_dict = self.compute_object_pose_metrics(preds, batch) if stage_name == "stage2" else self._zero_metric_dict(img.device)
         sv_obj_metric_dict = self.compute_sv_object_pose_metrics(preds, batch) if stage_name in ["stage1", "stage2"] else {
             "metric_sv_obj_rot_l1": img.new_tensor(0.0),
             "metric_sv_obj_rot_deg": img.new_tensor(0.0),
+            "metric_sv_obj_trans_l1": img.new_tensor(0.0),
+            "metric_sv_obj_trans_epe": img.new_tensor(0.0),
         }
         
         # GT 数据
         joints_2d_gt = batch["target_joints_uvd"][:, :, :, :2]  # (B, N, 21, 2)
         verts_2d_gt = batch["target_verts_uvd"][:, :, :, :2]  # (B, N, 778, 2)
-        obj_2d_center_gt = batch["target_obj_center_uv"]  # (B, N, 1, 2)
         joints_3d_master_gt = batch["master_joints_3d"]  # (B, 21, 3)
         verts_3d_master_gt = batch["master_verts_3d"]    # (B, 778, 3)
         obj_sparse_3d_master_gt = batch["master_obj_sparse"]  # (B, 2048, 3)
-        obj_center_3d_master_gt = batch["master_obj_center"]  # (B, 1, 3)
         joints_3d_gt = batch["target_joints_3d"].flatten(0, 1)  # (B*N, 21, 3)
         verts_3d_gt = batch["target_verts_3d"].flatten(0, 1)  # (B*N, 778, 3)
         joints_3d_rel_gt = batch["target_joints_3d_rel"].flatten(0, 1)  # (B*N, 21, 3)
@@ -2009,7 +1943,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         
         # 为了兼容性，使用 .get() 
         obj_pc_sparse = batch.get('target_obj_pc_sparse', None)
-        obj_pc_center = batch.get('target_obj_center_3d', None)
         
         # ==============================================================
         # 🌟 修复变量不对齐：从 hand_mesh_xyz 中切片分离 V 和 J
@@ -2030,11 +1963,7 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         # pred_hand_joints_3d = preds["hand_mesh_xyz"][:, self.num_hand_verts:] # (B, 21, 3)
         
         pred_ref_hand_joints_3d = preds["ref_hand"]  # (B, 21, 3)
-        pred_ref_obj_joints_3d = preds["ref_obj"]    # (B, 1, 3)
         pred_obj_sparse_3d = preds["obj_xyz_master"][-1]    # (B, 2048, 3)
-        pred_obj_center_3d = preds["obj_center_xyz_master"][-1]  # (B, 1, 3)
-        pred_ref_joints_2d = preds["pred_hand"].view(batch_size, n_views, self.num_hand_joints, 2)  # (B, N, 21, 2)
-        pred_obj_center_2d = preds["pred_obj"].view(batch_size, n_views, 1, 2)  # (B, N, 1, 2)
 
         pred_mano_3d_joints_master_in_cam = batch_cam_extr_transf(T_c2m_gt, pred_mano_3d_joints_master.unsqueeze(1).repeat(1, n_views, 1, 1)).flatten(0, 1)  # (B, N, 21, 3)
         pred_mano_3d_verts_master_in_cam = batch_cam_extr_transf(T_c2m_gt, pred_mano_3d_verts_master.unsqueeze(1).repeat(1, n_views, 1, 1)).flatten(0, 1)  # (B, N, 778, 3)
@@ -2050,7 +1979,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             self.MPJPE_MESH_MASTER_3D.feed(pred_mano_3d_mesh_mesh_master[:, self.num_hand_verts:], gt_kp=joints_3d_master_gt)
             self.MPVPE_MESH_MASTER_3D.feed(pred_mano_3d_mesh_mesh_master[:, :self.num_hand_verts], gt_kp=verts_3d_master_gt)
         self.MPRPE_HAND_3D.feed(pred_ref_hand_joints_3d, gt_kp=joints_3d_master_gt)
-        self.MPRPE_OBJ_3D.feed(pred_ref_obj_joints_3d, gt_kp=obj_center_3d_master_gt)
         self.PA_SV.feed(pred_mano_3d_joints_sv, joints_3d_rel_gt, pred_mano_3d_verts_sv, verts_3d_rel_gt)
         if pred_mano_3d_mesh_kp_master is not None:
             pred_mano_3d_joints_kp_master_in_cam = batch_cam_extr_transf(
@@ -2072,7 +2000,7 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             self.PA_MESH_MASTER.feed(
                 pred_mano_3d_joints_mesh_master_in_cam, joints_3d_gt, pred_mano_3d_verts_mesh_master_in_cam, verts_3d_gt
             )
-        obj_eval_rest = batch.get("master_obj_eval_rest", None)
+        obj_eval_rest = batch.get("master_obj_eval_rest", None) if use_full_recon_eval else None
         if obj_eval_rest is not None and preds.get("obj_rot6d", None) is not None and preds.get("obj_trans", None) is not None:
             pred_obj_dense_3d = self._build_object_points_from_hand_pose(
                 obj_eval_rest,
@@ -2093,18 +2021,16 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         if (
             obj_eval_rest is not None
             and preds.get("obj_view_rot6d_cam", None) is not None
+            and preds.get("obj_view_trans", None) is not None
             and batch.get("target_rot6d_label", None) is not None
             and batch.get("target_t_label_rel", None) is not None
             and batch.get("target_joints_3d", None) is not None
         ):
-            pred_ref_obj_cam = batch_cam_extr_transf(
-                torch.linalg.inv(batch["target_cam_extr"]),
-                preds["ref_obj"].unsqueeze(1).repeat(1, n_views, 1, 1),
-            )
-            pred_sv_obj_dense_3d = self._build_object_points_from_pose(
+            pred_sv_obj_dense_3d = self._build_object_points_from_hand_pose(
                 obj_eval_rest,
                 preds["obj_view_rot6d_cam"],
-                pred_ref_obj_cam,
+                batch["target_joints_3d"][:, :, self.center_idx:self.center_idx + 1],
+                preds["obj_view_trans"],
             )
             gt_sv_obj_dense_3d = self._build_object_points_from_hand_pose(
                 obj_eval_rest,
@@ -2113,15 +2039,12 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                 batch["target_t_label_rel"],
             )
             self.OBJ_RECON_SV.feed(pred_sv_obj_dense_3d.flatten(0, 1), gt_sv_obj_dense_3d.flatten(0, 1))
-        elif obj_pc_sparse is not None and preds.get("obj_view_rot6d_cam", None) is not None:
-            pred_ref_obj_cam = batch_cam_extr_transf(
-                torch.linalg.inv(batch["target_cam_extr"]),
-                preds["ref_obj"].unsqueeze(1).repeat(1, n_views, 1, 1),
-            )
-            pred_sv_obj_sparse_3d = self._build_object_points_from_pose(
+        elif obj_pc_sparse is not None and preds.get("obj_view_rot6d_cam", None) is not None and preds.get("obj_view_trans", None) is not None:
+            pred_sv_obj_sparse_3d = self._build_object_points_from_hand_pose(
                 batch["master_obj_sparse_rest"],
                 preds["obj_view_rot6d_cam"],
-                pred_ref_obj_cam,
+                batch["target_joints_3d"][:, :, self.center_idx:self.center_idx + 1],
+                preds["obj_view_trans"],
             )
             self.OBJ_RECON_SV.feed(pred_sv_obj_sparse_3d.flatten(0, 1), obj_pc_sparse.flatten(0, 1))
 
@@ -2134,7 +2057,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         self.summary.add_scalar("MPJPE_MESH_MASTER_3D_val", self.MPJPE_MESH_MASTER_3D.get_result(), step_idx)
         self.summary.add_scalar("MPVPE_MESH_MASTER_3D_val", self.MPVPE_MESH_MASTER_3D.get_result(), step_idx)
         self.summary.add_scalar("MPRPE_HAND_3D_val", self.MPRPE_HAND_3D.get_result(), step_idx)
-        self.summary.add_scalar("MPRPE_OBJ_3D_val", self.MPRPE_OBJ_3D.get_result(), step_idx)
         self.summary.add_scalar("PA_SV_val", self.PA_SV.get_result(), step_idx)
         self.summary.add_scalar("PA_KP_MASTER_val", self.PA_KP_MASTER.get_result(), step_idx)
         self.summary.add_scalar("PA_MESH_MASTER_val", self.PA_MESH_MASTER.get_result(), step_idx)
@@ -2144,26 +2066,27 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         self.summary.add_scalar("OBJREC_SV_CD_val", self.OBJ_RECON_SV.cd.avg, step_idx)
         self.summary.add_scalar("OBJREC_SV_FS_5_val", self.OBJ_RECON_SV.fs_5.avg, step_idx)
         self.summary.add_scalar("OBJREC_SV_FS_10_val", self.OBJ_RECON_SV.fs_10.avg, step_idx)
+        self.summary.add_scalar("VAL_RECON_IS_FULL_val", float(use_full_recon_eval), step_idx)
         if stage_name == "stage2":
             self.OBJ_POSE_VAL.feed(
                 pred_rot6d=preds["obj_rot6d"][-1],
                 pred_trans=preds["obj_trans"][-1],
-                pred_center=preds["obj_center_xyz_master"][-1],
                 gt_rot6d=batch["master_obj_rot6d_label"],
                 gt_trans=batch["master_obj_t_label_rel"],
-                gt_center=batch["master_obj_center"],
                 obj_points_rest=batch["master_obj_sparse_rest"],
             )
             obj_measures = self.OBJ_POSE_VAL.get_measures()
             self.summary.add_scalar("OBJ_ADD_val", obj_measures["Obj_add"], step_idx)
             self.summary.add_scalar("OBJ_ADDS_val", obj_measures["Obj_adds"], step_idx)
-            self.summary.add_scalar("OBJ_CENTER_EPE_val", obj_measures["Obj_center_epe"], step_idx)
             self.summary.add_scalar("OBJ_TRANS_EPE_val", obj_measures["Obj_trans_epe"], step_idx)
             self.summary.add_scalar("OBJ_ROT_DEG_val", obj_measures["Obj_rot_deg"], step_idx)
-        self.loss_metric.feed(sv_obj_metric_dict, batch_size)
-        for k, v in {**pose_metric_dict, **sv_obj_metric_dict}.items():
+        pose_metric_log_dict = self._pose_metrics_for_logging(pose_metric_dict)
+        metric_log_dict = {**pose_metric_log_dict, **sv_obj_metric_dict}
+        self.loss_metric.feed(metric_log_dict, batch_size)
+        for k, v in metric_log_dict.items():
             self.summary.add_scalar(f"{k}_val", v.item(), step_idx)
-        self._maybe_log_stage_transition_loss("val", epoch_idx, stage_name, {}, {**pose_metric_dict, **sv_obj_metric_dict})
+        self._log_sv_view_debug_scalars(preds, batch, step_idx, suffix="_val")
+        self._maybe_log_stage_transition_loss("val", epoch_idx, stage_name, {}, metric_log_dict)
 
         if step_idx % (self.train_log_interval * 5) == 0:
             self._log_visualizations("val", batch, preds, step_idx, stage_name)
@@ -2177,7 +2100,7 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             self.MPJPE_MASTER_3D, self.MPVPE_MASTER_3D,
             self.MPJPE_KP_MASTER_3D, self.MPVPE_KP_MASTER_3D,
             self.MPJPE_MESH_MASTER_3D, self.MPVPE_MESH_MASTER_3D,
-            self.MPRPE_HAND_3D, self.MPRPE_OBJ_3D,
+            self.MPRPE_HAND_3D,
             self.PA_SV, self.PA_KP_MASTER, self.PA_MESH_MASTER,
             self.OBJ_POSE_VAL, self.OBJ_RECON_SV, self.OBJ_RECON_MASTER,
         ], epoch_idx, comment=comment, summary=self.format_metric(mode="val_full"))
@@ -2190,7 +2113,6 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         self.MPJPE_MESH_MASTER_3D.reset()
         self.MPVPE_MESH_MASTER_3D.reset()
         self.MPRPE_HAND_3D.reset()
-        self.MPRPE_OBJ_3D.reset()
         self.PA_SV.reset()
         self.PA_KP_MASTER.reset()
         self.PA_MESH_MASTER.reset()
@@ -2206,79 +2128,14 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
         return self.validation_step(batch, step_idx, **kwargs)
     
     def draw_step(self, batch, step_idx, **kwargs):
-        pred = self._forward_impl(batch)
-        B, N, _, _, _ = batch["image"].size()
-        img = batch["image"][0]  # (N, 3, H, W)  4 channels
-        batch_joints_2d = batch['target_joints_uvd'][0]
-        batch_center_2d = batch['target_obj_center_uv'][0]
-        batch_verts_3d = batch["target_verts_3d"][0]
-        batch_intr = batch["target_cam_intr"][0]
-        # 尝试提取稀疏和密集点云 (为了兼容性，使用 .get() 和抛异常机制)
-        batch_master_verts = batch["master_verts_3d"]
-        batch_master_obj_center = batch["master_obj_center"]
-        try:
-            obj_pc_sparse = batch['target_obj_pc_sparse'][0]
-            obj_pc_center = batch['target_obj_center_3d'][0]
-        except KeyError:
-            obj_pc_sparse = None
-            obj_pc_center = None
-
-        gt_T_c2m = torch.linalg.inv(batch["target_cam_extr"])
-        gt_K = batch["target_cam_intr"]
-        pred_hand_joints_3d = pred["mano_3d_mesh_master"][:, self.num_hand_verts:]  # (B, 21, 3)
-        pred_hand_verts_3d = pred["mano_3d_mesh_master"][:, :self.num_hand_verts]  # (B, 778, 3)
-        pred_obj_sparse_3d = pred["obj_xyz_master"][-1]
-        pred_obj_center_3d = pred["obj_center_xyz_master"][-1]  # (B, 1, 3)
-        # ball_points = pred["ball_points"]
-        pred_joints = pred_hand_joints_3d.unsqueeze(1).repeat(1, N, 1, 1)  # (B, N, 21, 3)
-        pred_joints_in_cam = batch_cam_extr_transf(gt_T_c2m, pred_joints)
-        pred_joints_2d = batch_cam_intr_projection(gt_K, pred_joints_in_cam)  # (B, N, 21, 2)
-        pred_verts = pred_hand_verts_3d.unsqueeze(1).repeat(1, N, 1, 1)  # (B, N, 778, 3)
-        pred_verts_in_cam = batch_cam_extr_transf(gt_T_c2m, pred_verts)
-        pred_obj = pred_obj_sparse_3d.unsqueeze(1).repeat(1, N, 1, 1)  # (B, N, 2048, 3)
-        pred_obj_in_cam = batch_cam_extr_transf(gt_T_c2m, pred_obj)
-        pred_obj_center = pred_obj_center_3d.unsqueeze(1).repeat(1, N, 1, 1)  # (B, N, 1, 3)
-        pred_obj_center_in_cam = batch_cam_extr_transf(gt_T_c2m, pred_obj_center)
-        # bp = ball_points.unsqueeze(1).repeat(1, N, 1, 1)  # (B, N, num_ball_points, 3)
-        # bp_in_cam = batch_cam_extr_transf(gt_T_c2m, bp)
-
-        pred_ref_joints_2d = pred['pred_hand'].view(B, N, 21, 2)[0]
-        pred_ref_center_2d = pred['pred_obj'].view(B, N, 1, 2)[0]
-        pred_hand_joints_2d = pred_joints_2d[0] / 256  # 归一化到0~1
-        pred_hand_verts_3d = pred_verts_in_cam[0]
-        pred_obj_center_3d = pred_obj_center_in_cam[0]
-        pred_obj_sparse_3d = pred_obj_in_cam[0]
-        # ball_points_3d = bp_in_cam[0]
-
-        face = self.face
-        # draw_list = draw_batch_mesh_images_gt(batch_verts_3d, face, obj_pc_sparse, obj_pc_center, batch_intr, img)
-        joints_ref_draw_list = draw_batch_joint_center_images(pred_ref_joints_2d, batch_joints_2d, pred_ref_center_2d, batch_center_2d, img)
-        joints_ref_row1 = cv2.hconcat(joints_ref_draw_list[:4])  # 前4张拼成第一行
-        joints_ref_row2 = cv2.hconcat(joints_ref_draw_list[4:])  # 后4张拼成第二行
-
-        joints_draw_list = draw_batch_joint_center_images(pred_hand_joints_2d, batch_joints_2d, pred_ref_center_2d, batch_center_2d, img)
-        joints_row1 = cv2.hconcat(joints_draw_list[:4])  # 前4张拼成第一行
-        joints_row2 = cv2.hconcat(joints_draw_list[4:])  # 后4张拼成第二行
-
-        mesh_draw_list = draw_batch_mesh_images_pred(batch_verts_3d, pred_hand_verts_3d, face, obj_pc_sparse,
-                                                     pred_obj_sparse_3d, obj_pc_center, pred_obj_center_3d, batch_intr, img)
-        mesh_row1 = cv2.hconcat(mesh_draw_list[:4])  # 前4张拼成第一行
-        mesh_row2 = cv2.hconcat(mesh_draw_list[4:])  # 后
-
-        # 3. 垂直拼接：把两行拼成一张大图
-        joints_big_image_ref = cv2.vconcat([joints_ref_row1, joints_ref_row2])
-        cv2.imwrite('stitched_ref_image.jpg', cv2.cvtColor(joints_big_image_ref, cv2.COLOR_RGB2BGR))
-        print("参考 joints图片已保存为 stitched_ref_image.jpg")
-
-        joints_big_image = cv2.vconcat([joints_row1, joints_row2])
-        cv2.imwrite('stitched_image.jpg', cv2.cvtColor(joints_big_image, cv2.COLOR_RGB2BGR))
-        print("joints图片已保存为 stitched_joints_image.jpg")
-
-        mesh_big_image = cv2.vconcat([mesh_row1, mesh_row2])
-        cv2.imwrite('stitched_mesh_image.jpg', cv2.cvtColor(mesh_big_image, cv2.COLOR_RGB2BGR))
-        print("mesh图片已保存为 stitched_mesh_image.jpg")
-
-        return mesh_draw_list
+        epoch_idx = kwargs.get("epoch_idx", 0)
+        stage_name = self._resolve_stage(epoch_idx)
+        interaction_mode = self._stage_to_interaction_mode(stage_name)
+        self.current_stage_name = stage_name
+        self.current_stage2_warmup = self._stage2_object_warmup(epoch_idx, stage_name)
+        preds = self._forward_impl(batch, interaction_mode=interaction_mode)
+        self._log_visualizations("draw", batch, preds, step_idx, stage_name)
+        return preds
 
     def get_metric(self, preds, batch, **kwargs):
         """
@@ -2288,16 +2145,16 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
 
     def format_metric(self, mode="train"):
         def _fmt_mm_value(value):
-            return f"{float(value) * 1000.0:.4f}"
+            return f"{float(value) * 1000.0:.1f}"
 
         def _fmt_mm_pair(v1, v2):
-            return f"{float(v1) * 1000.0:.4f}/{float(v2) * 1000.0:.4f}"
+            return f"{float(v1) * 1000.0:.1f}/{float(v2) * 1000.0:.1f}"
 
         def _fmt_obj_recon(metric):
             return (
-                f"{metric.fs_5.avg:.4f}/"
-                f"{metric.fs_10.avg:.4f}/"
-                f"{metric.cd.avg:.4f}"
+                f"{metric.fs_5.avg:.3f}/"
+                f"{metric.fs_10.avg:.3f}/"
+                f"{metric.cd.avg:.3f}"
             )
 
         def _get_loss(name, default=0.0):
@@ -2305,17 +2162,23 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             return float(meter.avg) if meter is not None else float(default)
 
         if mode == "train":
-            l_hm = (
-                _get_loss('loss_heatmap_hand')
-                + _get_loss('loss_heatmap_obj')
-                + _get_loss('loss_heatmap_hand_map')
-                + _get_loss('loss_heatmap_obj_map')
+            l_hm = _get_loss('loss_heatmap_hand') + _get_loss('loss_heatmap_hand_map')
+            l_obj_init_rot = _get_loss("loss_obj_init_rot")
+            l_obj_init_trans = _get_loss("loss_obj_init_trans")
+            l_obj_init = l_obj_init_rot + l_obj_init_trans
+            l_obj_view_direct = (
+                _get_loss("loss_obj_view_rot_geo")
+                + _get_loss("loss_obj_view_rot_l1")
+                + _get_loss("loss_obj_view_trans")
             )
-            l_occ = _get_loss('loss_obj_occ')
-            l_obj_pose = _get_loss('loss_obj_pose')
+            l_obj_view_points = _get_loss("loss_obj_view_points")
+            l_obj_self = _get_loss("loss_obj_view_rot_self_geo") + _get_loss("loss_obj_view_rot_self_l1")
+            l_obj_master_aux = _get_loss("loss_obj_rot") + _get_loss("loss_obj_trans")
+            l_obj_master_points = _get_loss("loss_obj_points")
             m_obj_rot_deg = _get_loss('metric_obj_rot_deg')
             m_obj_trans = _get_loss('metric_obj_trans_epe')
             m_sv_obj_rot_deg = _get_loss('metric_sv_obj_rot_deg')
+            m_sv_obj_trans = _get_loss('metric_sv_obj_trans_epe')
             l_total = _get_loss('loss')
             l_triang = _get_loss('loss_triang')
             l_3d_jts = _get_loss('loss_3d_jts')
@@ -2327,46 +2190,38 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                 kp_j = self.MPJPE_KP_MASTER_3D.get_result()
                 kp_v = self.MPVPE_KP_MASTER_3D.get_result()
                 return (f"{stage_short}{warmup_suffix} | "
-                        f"TotL {l_total:.3f} | "
-                        f"TriL {l_triang:.3f} | "
-                        f"J3DL {l_3d_jts:.3f} | "
-                        f"Proj2DL {l_2d_proj:.3f} | "
-                        f"SVRot {m_sv_obj_rot_deg:.1f} | "
-                        f"SVObjRec {_fmt_obj_recon(self.OBJ_RECON_SV)} | "
-                        f"MasterObjRec {_fmt_obj_recon(self.OBJ_RECON_MASTER)} | "
-                        f"KPJ {_fmt_mm_value(kp_j)} | "
-                        f"KPV {_fmt_mm_value(kp_v)}")
+                        f"L {l_total:.3f} | "
+                        f"B H/T/J/P {l_hm:.3f}/{l_triang:.3f}/{l_3d_jts:.3f}/{l_2d_proj:.3f} | "
+                        f"SVL I/D/P/S {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f} | "
+                        f"KP {_fmt_mm_pair(kp_j, kp_v)} | "
+                        f"SV {m_sv_obj_rot_deg:.1f}/{_fmt_mm_value(m_sv_obj_trans)} | "
+                        f"RS {_fmt_obj_recon(self.OBJ_RECON_SV)} "
+                        f"RM {_fmt_obj_recon(self.OBJ_RECON_MASTER)}")
             if self.current_stage_name == "stage2":
                 kp_j = self.MPJPE_KP_MASTER_3D.get_result()
                 kp_v = self.MPVPE_KP_MASTER_3D.get_result()
                 return (f"{stage_short}{warmup_suffix} | "
-                        f"TotL {l_total:.3f} | "
-                        f"TriL {l_triang:.3f} | "
-                        f"J3DL {l_3d_jts:.3f} | "
-                        f"KPJ {_fmt_mm_value(kp_j)} | "
-                        f"KPV {_fmt_mm_value(kp_v)} | "
-                        f"OccL {l_occ:.3f} | "
-                        f"ObjPoseL {l_obj_pose:.3f} | "
-                        f"SVRot {m_sv_obj_rot_deg:.1f} | "
-                        f"SVObjRec {_fmt_obj_recon(self.OBJ_RECON_SV)} | "
-                        f"MasterObjRec {_fmt_obj_recon(self.OBJ_RECON_MASTER)} | "
-                        f"Rot {m_obj_rot_deg:.1f} | "
-                        f"Tr {_fmt_mm_value(m_obj_trans)}")
+                        f"L {l_total:.3f} | "
+                        f"B H/T/J {l_hm:.3f}/{l_triang:.3f}/{l_3d_jts:.3f} | "
+                        f"SVL I/D/P/S {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f} | "
+                        f"ML A/P {l_obj_master_aux:.3f}/{l_obj_master_points:.3f} | "
+                        f"KP {_fmt_mm_pair(kp_j, kp_v)} | "
+                        f"SV {m_sv_obj_rot_deg:.1f}/{_fmt_mm_value(m_sv_obj_trans)} "
+                        f"M {m_obj_rot_deg:.1f}/{_fmt_mm_value(m_obj_trans)} | "
+                        f"RS {_fmt_obj_recon(self.OBJ_RECON_SV)} "
+                        f"RM {_fmt_obj_recon(self.OBJ_RECON_MASTER)}")
             kp_j = self.MPJPE_KP_MASTER_3D.get_result()
             kp_v = self.MPVPE_KP_MASTER_3D.get_result()
             return (f"{stage_short}{warmup_suffix} | "
-                    f"TotL {l_total:.3f} | "
-                    f"TriL {l_triang:.3f} | "
-                    f"J3DL {l_3d_jts:.3f} | "
-                    f"KPJ {_fmt_mm_value(kp_j)} | "
-                    f"KPV {_fmt_mm_value(kp_v)} | "
-                    f"OccL {l_occ:.3f} | "
-                    f"ObjPoseL {l_obj_pose:.3f} | "
-                    f"SVRot {m_sv_obj_rot_deg:.1f} | "
-                    f"SVObjRec {_fmt_obj_recon(self.OBJ_RECON_SV)} | "
-                    f"MasterObjRec {_fmt_obj_recon(self.OBJ_RECON_MASTER)} | "
-                    f"Rot {m_obj_rot_deg:.1f} | "
-                    f"Tr {_fmt_mm_value(m_obj_trans)}")
+                    f"L {l_total:.3f} | "
+                    f"B H/T/J {l_hm:.3f}/{l_triang:.3f}/{l_3d_jts:.3f} | "
+                    f"SVL I/D/P/S {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f} | "
+                    f"ML A/P {l_obj_master_aux:.3f}/{l_obj_master_points:.3f} | "
+                    f"KP {_fmt_mm_pair(kp_j, kp_v)} | "
+                    f"SV {m_sv_obj_rot_deg:.1f}/{_fmt_mm_value(m_sv_obj_trans)} "
+                    f"M {m_obj_rot_deg:.1f}/{_fmt_mm_value(m_obj_trans)} | "
+                    f"RS {_fmt_obj_recon(self.OBJ_RECON_SV)} "
+                    f"RM {_fmt_obj_recon(self.OBJ_RECON_MASTER)}")
         elif mode == "test":
             metric_toshow = [self.PA, self.MPJPE_HAND_3D]
         else:
@@ -2380,8 +2235,18 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             mesh_j = self.MPJPE_MESH_MASTER_3D.get_result()
             mesh_v = self.MPVPE_MESH_MASTER_3D.get_result()
             ref_j = self.MPRPE_HAND_3D.get_result()
-            ref_o = self.MPRPE_OBJ_3D.get_result()
             sv_obj_rot_deg = _get_loss('metric_sv_obj_rot_deg')
+            sv_obj_trans_epe = _get_loss('metric_sv_obj_trans_epe')
+            l_obj_init = _get_loss("loss_obj_init_rot") + _get_loss("loss_obj_init_trans")
+            l_obj_view_direct = (
+                _get_loss("loss_obj_view_rot_geo")
+                + _get_loss("loss_obj_view_rot_l1")
+                + _get_loss("loss_obj_view_trans")
+            )
+            l_obj_view_points = _get_loss("loss_obj_view_points")
+            l_obj_self = _get_loss("loss_obj_view_rot_self_geo") + _get_loss("loss_obj_view_rot_self_l1")
+            l_obj_master_aux = _get_loss("loss_obj_rot") + _get_loss("loss_obj_trans")
+            l_obj_master_points = _get_loss("loss_obj_points")
 
             def _fmt_triplet(name, pa_dict, mp, mv):
                 if mp <= 0 and mv <= 0:
@@ -2404,29 +2269,40 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                     f"MPJPE/MPVPE {_fmt_mm_pair(mp, mv)}"
                 )
 
+            stage_prefix = self._stage_display_name(self.current_stage_name, short=True)
+            recon_mode = self.current_val_recon_mode.upper()
+
             if mode == "val_full":
                 msg = " | ".join([
+                    f"RecEval {recon_mode}",
                     _fmt_triplet_full("SingleView", pa_sv, sv_j, sv_v),
                     _fmt_triplet_full("KeypointMaster", pa_kp, kp_j, kp_v),
                     (
                         f"Object ADD/ADD-S {_fmt_mm_pair(self.OBJ_POSE_VAL.add.avg, self.OBJ_POSE_VAL.adds.avg)} "
-                        f"CenterEPE/TranslationEPE {_fmt_mm_pair(self.OBJ_POSE_VAL.center_epe.avg, self.OBJ_POSE_VAL.trans_epe.avg)} "
+                        f"TranslationEPE {_fmt_mm_value(self.OBJ_POSE_VAL.trans_epe.avg)} "
                         f"RotationError {self.OBJ_POSE_VAL.rot_deg.avg:.1f} deg"
                         if self.current_stage_name == "stage2" and self.OBJ_POSE_VAL.count > 0 else
-                        "Object ADD/ADD-S/CenterEPE/TranslationEPE/RotationError -/-/-/-/-"
+                        "Object ADD/ADD-S/TranslationEPE/RotationError -/-/-/-"
                     ),
                     (
-                        f"SVObject RotationError {sv_obj_rot_deg:.1f} deg"
+                        f"SVObjectRot/Trans {sv_obj_rot_deg:.1f} deg/{_fmt_mm_value(sv_obj_trans_epe)}"
                         if self.current_stage_name in ["stage1", "stage2"] else
-                        "SVObject RotationError -"
+                        "SVObjectRot/Trans -/-"
+                    ),
+                    f"SVLoss I/D/P/S {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f}",
+                    (
+                        f"MasterLoss Aux/Pts {l_obj_master_aux:.3f}/{l_obj_master_points:.3f}"
+                        if self.current_stage_name == "stage2" else
+                        "MasterLoss Aux/Pts -/-"
                     ),
                     f"SVObjectRecon FS@5/10/CD {_fmt_obj_recon(self.OBJ_RECON_SV)}",
                     f"MasterObjectRecon FS@5/10/CD {_fmt_obj_recon(self.OBJ_RECON_MASTER)}",
-                    f"Reference Hand/Object {_fmt_mm_pair(ref_j, ref_o)}",
+                    f"Reference Hand {_fmt_mm_value(ref_j)}",
                 ])
-                return f"{self._stage_display_name(self.current_stage_name, short=True)} | {msg}"
+                return f"{stage_prefix} | {msg}"
 
             msg = " | ".join([
+                f"RecEval {recon_mode}",
                 f"PA { _fmt_pa_only('SV', pa_sv, sv_j, sv_v) } { _fmt_pa_only('KP', pa_kp, kp_j, kp_v) }",
                 (
                     f"Obj A/S {_fmt_mm_pair(self.OBJ_POSE_VAL.add.avg, self.OBJ_POSE_VAL.adds.avg)}"
@@ -2434,14 +2310,25 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                     "Obj A/S -/-"
                 ),
                 (
-                    f"SVObjRot {sv_obj_rot_deg:.1f}"
+                    f"Rot {self.OBJ_POSE_VAL.rot_deg.avg:.1f} Tr {_fmt_mm_value(self.OBJ_POSE_VAL.trans_epe.avg)}"
+                    if self.current_stage_name == "stage2" and self.OBJ_POSE_VAL.count > 0 else
+                    "Rot/Tr -/-"
+                ),
+                (
+                    f"SVRot {sv_obj_rot_deg:.1f} SVTr {_fmt_mm_value(sv_obj_trans_epe)}"
                     if self.current_stage_name in ["stage1", "stage2"] else
-                    "SVObjRot -"
+                    "SVRot/SVTr -/-"
+                ),
+                f"SVL I/D/P/S {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f}",
+                (
+                    f"ML A/P {l_obj_master_aux:.3f}/{l_obj_master_points:.3f}"
+                    if self.current_stage_name == "stage2" else
+                    "ML A/P -/-"
                 ),
                 f"SVObjRec {_fmt_obj_recon(self.OBJ_RECON_SV)}",
                 f"MasterObjRec {_fmt_obj_recon(self.OBJ_RECON_MASTER)}",
-                f"Ref {_fmt_mm_pair(ref_j, ref_o)}",
+                f"Ref {_fmt_mm_value(ref_j)}",
             ])
-            return f"{self._stage_display_name(self.current_stage_name, short=True)} | {msg}"
+            return f"{stage_prefix} | {msg}"
 
         return " | ".join([str(me) for me in metric_toshow])

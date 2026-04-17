@@ -1,7 +1,7 @@
 # HOR SV/Master Object Pose Design
 
 Date: 2026-04-13
-Current Commit: `55be9ff`
+Current Commit: `39c635c`
 
 ## Goal
 
@@ -343,6 +343,76 @@ It should serve as:
 
 It should not remain the only source of translation information for `SV` object pose.
 
+## Multi-Object Ambiguity and Why 2D Object Center Should Be Removed from the Main Path
+
+There is a structural ambiguity in the current 2D object-center branch.
+
+Unlike the hand branch:
+
+- hand topology is fixed
+- hand keypoints have stable semantics
+- the network is not usually confused by several unrelated hand categories
+
+the object branch faces a different problem:
+
+- objects are category-diverse
+- the current image may contain multiple objects
+- a plain 2D center head is not necessarily target-object-conditioned
+- the most visually salient object center is not always the labeled target object center
+
+This creates a failure mode:
+
+- the network predicts the center of another visible object
+- the confidence can still be high
+- the triangulated 3D object reference becomes wrong but over-confident
+- stage2 object initialization is then pulled toward the wrong target
+
+This risk is especially harmful on validation and test:
+
+- the error is not just noisy localization
+- it is a semantically wrong object association
+- once it enters `ref_obj` or object initialization, the whole downstream pose branch can be biased
+
+Because of this, the current 2D object-center branch should not remain on the primary object-pose path unless it becomes explicitly target-conditioned.
+
+## Recommended Decision About the 2D Object Center Branch
+
+If the next refactor upgrades `SV` to predict full pose `(R_v, d_v)`, then the recommended decision is:
+
+- remove the 2D object-center branch from the primary training and inference path
+
+That means:
+
+- do not use it for `ref_obj` primary initialization
+- do not use it for `master` object pose initialization
+- do not use it as the substitute for `SV` translation
+- do not let it dominate confidence weighting for the final object pose path
+
+This branch may still be kept only if one of the following is added:
+
+- target object identity conditioning
+- target object template conditioning
+- object-specific ROI conditioning
+- an explicit target-selection mechanism
+
+Without such conditioning, the branch is structurally ambiguous in multi-object scenes.
+
+## Updated Recommendation
+
+The stronger recommendation for the next design iteration is:
+
+- `SV` predicts full pose `(R_v, d_v)`
+- `master` predicts full pose `(R_m, d_m)`
+- 2D object center is removed from the main object-pose pipeline
+
+Under this design:
+
+- `SV -> master` initialization comes from `SV` pose, not from triangulated object center
+- `master -> SV` self-distillation operates on both rotation and translation
+- the main object pose path no longer depends on an ambiguous 2D center detector
+
+This is more coherent geometrically and safer semantically in multi-object scenes.
+
 ## Recommended Loss Structure
 
 ### SV branch
@@ -477,3 +547,31 @@ Current relevant files:
 - [`lib/datasets/hdata.py`](/media/hl/data/code/han/POEM/lib/datasets/hdata.py)
 - [`lib/utils/transform.py`](/media/hl/data/code/han/POEM/lib/utils/transform.py)
 
+## Implementation Status
+
+Implemented in code in this iteration:
+
+- `HOR.py`
+  - `SV` object branch now predicts full per-view pose:
+    - `obj_view_rot6d_cam`
+    - `obj_view_trans`
+  - `SV` object feature uses `global_feat + hand_obj_fused_flat`
+  - master initialization now uses `SV` master-view pose:
+    - `obj_init_rot6d`
+    - `obj_init_trans`
+  - stage1/stage2 `SV` supervision now covers both rotation and translation
+  - `SV` reconstruction metrics now rebuild object point clouds from `SV` relative pose instead of `ref_obj`
+
+- `HOR_heatmap.py`
+  - same semantic changes as `HOR.py`
+  - heatmap object-center branch is no longer used as the main object-pose initialization path
+
+- `ptHOR_head.py`
+  - accepts `obj_init_trans`
+  - object initialization center is derived from `hand_center + obj_init_trans`
+  - stage2 object branch no longer depends on center-triangulation as the primary translation source
+
+Current simplification kept intentionally:
+
+- `master -> SV` self-distillation is still rotation-only in code for now
+- translation self-distillation can be added later after the new supervised `SV` full-pose branch is verified stable

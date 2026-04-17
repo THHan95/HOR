@@ -9,11 +9,12 @@ from typing import Callable
 from ...utils.builder import TRANSFORMER
 from ...utils.net_utils import xavier_init
 from ...utils.transform import inverse_sigmoid
+from ...utils.object_pose_utils import pose_from_keypoints
 from ...utils.logger import logger
 from ...utils.misc import param_size
 from ...utils.points_utils import index_points
 from transformers.models.bert.modeling_bert import BertConfig
-from ..bricks.pt_metro_transformer import point_METRO_block, point_METRO_block_HO_Light
+from ..bricks.pt_metro_transformer import point_METRO_block
 from ..bricks.point_transformers import (
     ptTransformerBlock,
     ptTransformerBlock_CrossAttn,
@@ -35,23 +36,16 @@ class HORHandObjectContext:
     hand_mesh_master: torch.Tensor
     current_rot6d: torch.Tensor
     current_trans_norm: torch.Tensor
-    obj_view_conf: torch.Tensor
-    obj_view_conf_xy: torch.Tensor
-    obj_occ_map: torch.Tensor
     feat_map: torch.Tensor
     img_metas: dict
     inp_res: torch.Tensor
-    obj_center_feat: torch.Tensor
     global_mv_feat: torch.Tensor
     sample_multiview_features_fn: Callable
     project_points_to_views_fn: Callable
     build_object_points_from_pose_fn: Callable
-    build_object_point_view_weights_fn: Callable
-    update_object_pose_fn: Callable
     obj_feat_fuser: nn.Module
     hand_update_scale: float
     obj_feat_update_scale: float
-    pose_delta_scale: float
 
 
 @dataclass
@@ -66,7 +60,6 @@ class HORHandAnchorOutput:
 class HORMeshObjOutput:
     all_hand_mesh_xyz_master: torch.Tensor
     all_obj_xyz_master: torch.Tensor
-    all_obj_center_xyz_master: torch.Tensor
     all_obj_rot6d: torch.Tensor
     all_obj_trans: torch.Tensor
     final_hand_mesh_xyz_norm: torch.Tensor
@@ -314,62 +307,50 @@ class _HORTRBase(nn.Module):
     def _forward_mesh_obj(self, query_xyz, query_feat, hand_object_context):
         obj_template = hand_object_context.obj_template
         hand_center_point = hand_object_context.hand_center_point
-        current_rot6d = hand_object_context.current_rot6d
-        current_trans_norm = hand_object_context.current_trans_norm
         feat_map = hand_object_context.feat_map
         img_metas = hand_object_context.img_metas
         inp_res = hand_object_context.inp_res
-        obj_center_feat = hand_object_context.obj_center_feat
-        global_mv_feat = hand_object_context.global_mv_feat
         sample_multiview_features_fn = hand_object_context.sample_multiview_features_fn
         project_points_to_views_fn = hand_object_context.project_points_to_views_fn
         build_object_points_from_pose_fn = hand_object_context.build_object_points_from_pose_fn
-        build_object_point_view_weights_fn = hand_object_context.build_object_point_view_weights_fn
-        update_object_pose_fn = hand_object_context.update_object_pose_fn
         obj_feat_fuser = hand_object_context.obj_feat_fuser
         hand_update_scale = hand_object_context.hand_update_scale
         obj_feat_update_scale = hand_object_context.obj_feat_update_scale
-        pose_delta_scale = hand_object_context.pose_delta_scale
 
         hand_xyz_norm_abs_max = 25.0
         hand_xyz_master_abs_max = 5.0
+        obj_xyz_norm_abs_max = 20.0
         feat_abs_max = 100.0
         current_hand_xyz = self._sanitize_tensor(query_xyz, hand_xyz_norm_abs_max)
         current_hand_feats = self._sanitize_tensor(query_feat, feat_abs_max)
         current_obj_feats = None
+        current_rot6d = hand_object_context.current_rot6d
+        current_trans_norm = hand_object_context.current_trans_norm
+        current_obj_xyz_norm, current_obj_xyz_master, _, current_obj_trans = build_object_points_from_pose_fn(
+            obj_template,
+            hand_center_point,
+            current_rot6d,
+            current_trans_norm,
+        )
+        current_obj_xyz_norm = self._sanitize_tensor(current_obj_xyz_norm, obj_xyz_norm_abs_max)
+        current_obj_xyz_master = self._sanitize_tensor(current_obj_xyz_master, obj_xyz_norm_abs_max * 0.2)
+        current_obj_trans = self._sanitize_tensor(current_obj_trans, 10.0)
 
         all_hand_mesh_xyz_master = []
         all_obj_xyz_master = []
-        all_obj_center_xyz_master = []
         all_obj_rot6d = []
         all_obj_trans = []
 
         batch_size, num_cams = feat_map.shape[:2]
 
         for layer_idx, block in enumerate(self._iter_blocks()):
-            current_obj_xyz_norm, current_obj_xyz_master, current_obj_center_master, _ = build_object_points_from_pose_fn(
-                obj_template,
-                hand_center_point,
-                current_rot6d,
-                current_trans_norm,
-            )
             obj_query_2d = project_points_to_views_fn(current_obj_xyz_master, img_metas, inp_res)
-            obj_point_view_weights = build_object_point_view_weights_fn(
-                current_obj_xyz_master,
-                current_obj_center_master,
-                img_metas,
-                inp_res,
-                hand_object_context.obj_view_conf,
-                hand_object_context.obj_view_conf_xy,
-                hand_object_context.obj_occ_map,
-            )
             obj_img_feats = sample_multiview_features_fn(
                 feat_map,
                 obj_query_2d,
                 batch_size,
                 num_cams,
                 current_obj_xyz_master.shape[1],
-                view_weights=obj_point_view_weights,
             )
             obj_img_feats = self._sanitize_tensor(obj_img_feats, feat_abs_max)
 
@@ -382,8 +363,9 @@ class _HORTRBase(nn.Module):
 
             prev_hand_xyz = current_hand_xyz
             prev_hand_feats = current_hand_feats
+            prev_obj_xyz = current_obj_xyz_norm
             prev_obj_feats = current_obj_feats
-            next_hand_xyz, next_hand_feats, _, next_obj_feats = block(
+            next_hand_xyz, next_hand_feats, next_obj_xyz, next_obj_feats = block(
                 hand_xyz=current_hand_xyz,
                 hand_feats=current_hand_feats,
                 obj_xyz=current_obj_xyz_norm,
@@ -392,48 +374,49 @@ class _HORTRBase(nn.Module):
             )
             self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "next_hand_xyz", next_hand_xyz)
             self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "next_hand_feats", next_hand_feats)
+            self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "next_obj_xyz", next_obj_xyz)
             self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "next_obj_feats", next_obj_feats)
             next_hand_xyz = self._stabilize_tensor(next_hand_xyz, hand_xyz_norm_abs_max, fallback=prev_hand_xyz)
             next_hand_feats = self._stabilize_tensor(next_hand_feats, feat_abs_max, fallback=prev_hand_feats)
+            next_obj_xyz = self._stabilize_tensor(next_obj_xyz, obj_xyz_norm_abs_max, fallback=prev_obj_xyz)
             next_obj_feats = self._stabilize_tensor(next_obj_feats, feat_abs_max, fallback=prev_obj_feats)
 
             current_hand_xyz = prev_hand_xyz + hand_update_scale * (next_hand_xyz - prev_hand_xyz)
             current_hand_feats = prev_hand_feats + hand_update_scale * (next_hand_feats - prev_hand_feats)
+            current_obj_xyz_norm = prev_obj_xyz + obj_feat_update_scale * (next_obj_xyz - prev_obj_xyz)
             current_obj_feats = prev_obj_feats + obj_feat_update_scale * (next_obj_feats - prev_obj_feats)
             self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "current_hand_xyz", current_hand_xyz)
             self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "current_hand_feats", current_hand_feats)
+            self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "current_obj_xyz_norm", current_obj_xyz_norm)
             self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "current_obj_feats", current_obj_feats)
             current_hand_xyz = self._stabilize_tensor(current_hand_xyz, hand_xyz_norm_abs_max, fallback=prev_hand_xyz)
             current_hand_feats = self._stabilize_tensor(current_hand_feats, feat_abs_max, fallback=prev_hand_feats)
+            current_obj_xyz_norm = self._stabilize_tensor(current_obj_xyz_norm, obj_xyz_norm_abs_max, fallback=prev_obj_xyz)
             current_obj_feats = self._stabilize_tensor(current_obj_feats, feat_abs_max, fallback=prev_obj_feats)
 
-            current_rot6d, current_trans_norm = update_object_pose_fn(
-                current_obj_feats,
-                obj_center_feat,
-                global_mv_feat,
-                current_rot6d,
-                current_trans_norm,
-                warmup_scale=pose_delta_scale,
+            current_obj_xyz_master = self._sanitize_tensor(
+                (current_obj_xyz_norm * 0.2) + hand_center_point,
+                obj_xyz_norm_abs_max * 0.2,
             )
-            current_obj_xyz_norm, current_obj_xyz_master, current_obj_center_xyz_master, current_obj_trans = build_object_points_from_pose_fn(
-                obj_template,
-                hand_center_point,
-                current_rot6d,
-                current_trans_norm,
+            pose_dict = pose_from_keypoints(
+                rest_points=obj_template,
+                pred_points=current_obj_xyz_master,
+                hand_root=hand_center_point.squeeze(-2),
             )
+            current_rot6d = self._stabilize_tensor(pose_dict["rot6d"], 10.0)
+            current_obj_trans = self._stabilize_tensor(pose_dict["trans_rel"], 10.0)
+            current_trans_norm = self._stabilize_tensor(current_obj_trans / 0.2, 10.0)
 
             all_hand_mesh_xyz_master.append(
                 self._sanitize_tensor((current_hand_xyz * 0.2) + hand_center_point, hand_xyz_master_abs_max)
             )
             all_obj_xyz_master.append(current_obj_xyz_master)
-            all_obj_center_xyz_master.append(current_obj_center_xyz_master)
             all_obj_rot6d.append(current_rot6d)
             all_obj_trans.append(current_obj_trans)
 
         return HORMeshObjOutput(
             all_hand_mesh_xyz_master=torch.stack(all_hand_mesh_xyz_master),
             all_obj_xyz_master=torch.stack(all_obj_xyz_master),
-            all_obj_center_xyz_master=torch.stack(all_obj_center_xyz_master),
             all_obj_rot6d=torch.stack(all_obj_rot6d),
             all_obj_trans=torch.stack(all_obj_trans),
             final_hand_mesh_xyz_norm=self._sanitize_tensor(current_hand_xyz, hand_xyz_norm_abs_max),
@@ -501,130 +484,6 @@ class HORTR_HO(_HORTRBase):
         if pt_xyz is None or pt_feats is None:
             raise ValueError("HORTR_HO requires pt_xyz and pt_feats for non-mesh_obj interaction")
         return self._forward_default(query_xyz, query_feat, pt_xyz, pt_feats, interaction_mode=interaction_mode)
-
-
-@TRANSFORMER.register_module()
-class HORTR_HO_Light(nn.Module):
-
-    def __init__(self, cfg):
-        super().__init__()
-        self.name = type(self).__name__
-        self.cfg = cfg
-        self.feat_dim = cfg.INPUT_FEAT_DIM
-        self.hidden_feat_dim = cfg.INPUT_FEAT_DIM
-        config_class = BertConfig
-        config = config_class.from_pretrained("config/backbone/bert_cfg.json")
-        config.output_attentions = False
-        config.hidden_dropout_prob = cfg.DROPOUT
-        config.img_feature_dim = self.feat_dim
-        config.output_feature_dim = self.feat_dim
-        config.hidden_size = self.hidden_feat_dim
-        config.intermediate_size = self.hidden_feat_dim * 4
-        config.max_position_embeddings = 2048
-        config.n_neighbor = cfg.N_NEIGHBOR
-        config.n_neighbor_query = cfg.N_NEIGHBOR_QUERY
-        config.init_block = False
-        config.obj_pose_rot_delta_abs_max = float(cfg.get("OBJ_POSE_ROT_DELTA_ABS_MAX", 0.2))
-        config.obj_pose_trans_delta_abs_max = float(cfg.get("OBJ_POSE_TRANS_DELTA_ABS_MAX", 0.1))
-
-        update_params = ['num_hidden_layers', 'hidden_size', 'num_attention_heads', 'intermediate_size']
-        for param in update_params:
-            arg_param = getattr(cfg, param.upper(), None)
-            if arg_param is not None and arg_param > 0 and getattr(config, param) != arg_param:
-                setattr(config, param, arg_param)
-
-        self.ho_pose_block = point_METRO_block_HO_Light(config=config)
-
-        logger.info(f"{type(self).__name__} has {param_size(self)}M parameters")
-
-    @staticmethod
-    def _sanitize_tensor(x, abs_max, nan_value=0.0):
-        return torch.nan_to_num(x, nan=nan_value, posinf=abs_max, neginf=-abs_max).clamp(-abs_max, abs_max)
-
-    @staticmethod
-    def _log_nonfinite_tensor(tag, tensor_name, x):
-        finite_mask = torch.isfinite(x)
-        if finite_mask.all():
-            return
-        x_detached = x.detach()
-        safe_x = torch.where(finite_mask, x_detached, torch.zeros_like(x_detached))
-        logger.warning(
-            f"[{tag}] tensor={tensor_name} "
-            f"finite_ratio={float(finite_mask.float().mean().item()):.6f} "
-            f"nan={int(torch.isnan(x_detached).sum().item())} "
-            f"inf={int(torch.isinf(x_detached).sum().item())} "
-            f"max_finite_abs={float(safe_x.abs().max().item()):.4f}"
-        )
-
-    def _stabilize_tensor(self, x, abs_max, fallback=None, nan_value=0.0):
-        if fallback is not None:
-            fallback = self._sanitize_tensor(fallback, abs_max, nan_value=nan_value).to(dtype=x.dtype, device=x.device)
-            finite_mask = torch.isfinite(x)
-            if not finite_mask.all():
-                x = torch.where(finite_mask, x, fallback)
-        return self._sanitize_tensor(x, abs_max, nan_value=nan_value)
-
-    def forward(
-        self,
-        query_xyz,
-        query_feat,
-        pt_xyz=None,
-        pt_feats=None,
-        hand_object_context=None,
-        **kwargs,
-    ):
-        if hand_object_context is None:
-            raise ValueError("HORTR_HO_Light requires hand_object_context")
-        if pt_xyz is None or pt_feats is None:
-            raise ValueError("HORTR_HO_Light requires pt_xyz and pt_feats")
-
-        hand_xyz_norm_abs_max = 25.0
-        obj_xyz_norm_abs_max = 20.0
-        feat_abs_max = 100.0
-
-        current_obj_xyz = self._sanitize_tensor(query_xyz, obj_xyz_norm_abs_max)
-        current_obj_feats = self._sanitize_tensor(query_feat, feat_abs_max)
-        current_hand_xyz = self._sanitize_tensor(pt_xyz, hand_xyz_norm_abs_max)
-        current_hand_feats = self._sanitize_tensor(pt_feats, feat_abs_max)
-        obj_center_feat = self._sanitize_tensor(hand_object_context.obj_center_feat, feat_abs_max)
-        global_mv_feat = self._sanitize_tensor(hand_object_context.global_mv_feat, feat_abs_max)
-        current_rot6d = self._sanitize_tensor(hand_object_context.current_rot6d, 10.0)
-        current_trans_norm = self._sanitize_tensor(hand_object_context.current_trans_norm, 10.0)
-
-        next_obj_feats, next_rot6d, next_trans_norm = self.ho_pose_block(
-            hand_xyz=current_hand_xyz,
-            hand_feats=current_hand_feats,
-            obj_xyz=current_obj_xyz,
-            obj_feats=current_obj_feats,
-            obj_center_feat=obj_center_feat,
-            global_mv_feat=global_mv_feat,
-            current_rot6d=current_rot6d,
-            current_trans_norm=current_trans_norm,
-            warmup_scale=hand_object_context.pose_delta_scale,
-        )
-        self._log_nonfinite_tensor("NonFiniteHOLight", "next_obj_feats", next_obj_feats)
-        self._log_nonfinite_tensor("NonFiniteHOLight", "next_rot6d", next_rot6d)
-        self._log_nonfinite_tensor("NonFiniteHOLight", "next_trans_norm", next_trans_norm)
-        next_obj_feats = self._stabilize_tensor(next_obj_feats, feat_abs_max, fallback=current_obj_feats)
-        next_rot6d = self._stabilize_tensor(next_rot6d, 10.0, fallback=current_rot6d)
-        next_trans_norm = self._stabilize_tensor(next_trans_norm, 10.0, fallback=current_trans_norm)
-
-        _, next_obj_xyz_master, next_obj_center_master, next_obj_trans = hand_object_context.build_object_points_from_pose_fn(
-            hand_object_context.obj_template,
-            hand_object_context.hand_center_point,
-            next_rot6d,
-            next_trans_norm,
-        )
-
-        return HORMeshObjOutput(
-            all_hand_mesh_xyz_master=hand_object_context.hand_mesh_master.unsqueeze(0),
-            all_obj_xyz_master=next_obj_xyz_master.unsqueeze(0),
-            all_obj_center_xyz_master=next_obj_center_master.unsqueeze(0),
-            all_obj_rot6d=next_rot6d.unsqueeze(0),
-            all_obj_trans=next_obj_trans.unsqueeze(0),
-            final_hand_mesh_xyz_norm=current_hand_xyz,
-            final_hand_mesh_feats_norm=current_hand_feats,
-        )
 
 
 @TRANSFORMER.register_module()

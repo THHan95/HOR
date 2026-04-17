@@ -100,10 +100,6 @@ class SimpleTransform2D:
         self._with_mask = cfg.DATA_PRESET.get("WITH_MASK", False)
         self._heatmap_size = cfg.DATA_PRESET.get("HEATMAP_SIZE", (64, 64))
         self._heatmap_sigma = cfg.DATA_PRESET.get("HEATMAP_SIGMA", 2.0)
-        self._with_obj_occ = cfg.DATA_PRESET.get("WITH_OBJ_OCC", self._with_heatmap)
-        self._obj_occ_size = cfg.DATA_PRESET.get("OBJ_OCC_SIZE", self._heatmap_size)
-        self._obj_occ_radius = int(cfg.DATA_PRESET.get("OBJ_OCC_RADIUS", 1))
-        self._obj_occ_blur_sigma = float(cfg.DATA_PRESET.get("OBJ_OCC_BLUR_SIGMA", 1.0))
         self._mask_scale_to_heatmap = cfg.DATA_PRESET.get("MASK_SCALE_TO_HEATMAP", False)
 
         if self._occlusion:
@@ -123,55 +119,6 @@ class SimpleTransform2D:
             target_heatmap[i], _ = generate_heatmap(target_heatmap[i], coord_hm, self._heatmap_sigma)
 
         return target_heatmap
-
-    def _generate_point_occupancy_map(self, coords_2d, depth=None):
-        occ_h, occ_w = self._obj_occ_size[1], self._obj_occ_size[0]
-        occupancy = np.zeros((occ_h, occ_w), dtype=np.float32)
-        if coords_2d is None:
-            return occupancy
-
-        coords_2d = np.asarray(coords_2d, dtype=np.float32)
-        if coords_2d.size == 0:
-            return occupancy
-
-        if depth is not None:
-            depth = np.asarray(depth, dtype=np.float32).reshape(-1)
-            valid = depth > 1e-6
-            coords_2d = coords_2d[valid]
-        if coords_2d.size == 0:
-            return occupancy
-
-        imsize = np.array(self._output_size, dtype=np.float32)
-        occsize = np.array(self._obj_occ_size, dtype=np.float32)
-        coords_occ = (coords_2d / imsize) * occsize
-        inside = (
-            (coords_occ[:, 0] >= 0.0)
-            & (coords_occ[:, 0] < occ_w)
-            & (coords_occ[:, 1] >= 0.0)
-            & (coords_occ[:, 1] < occ_h)
-        )
-        coords_occ = coords_occ[inside]
-        if coords_occ.size == 0:
-            return occupancy
-
-        radius = max(1, self._obj_occ_radius)
-        for x_f, y_f in coords_occ:
-            x_i = int(np.clip(round(float(x_f)), 0, occ_w - 1))
-            y_i = int(np.clip(round(float(y_f)), 0, occ_h - 1))
-            cv2.circle(occupancy, (x_i, y_i), radius=radius, color=1.0, thickness=-1)
-
-        if self._obj_occ_blur_sigma > 0:
-            occupancy = cv2.GaussianBlur(
-                occupancy,
-                ksize=(0, 0),
-                sigmaX=self._obj_occ_blur_sigma,
-                sigmaY=self._obj_occ_blur_sigma,
-            )
-
-        max_value = float(occupancy.max())
-        if max_value > 0:
-            occupancy /= max_value
-        return occupancy.astype(np.float32)
 
     def set_stage(self, stage_name: str):
         self.current_stage_name = stage_name
@@ -348,8 +295,8 @@ class SimpleTransform3DMultiView(SimpleTransformUVD):
         target_joints_3d_no_rot = label.get("joints_3d")
         target_verts_3d_no_rot = label.get("verts_3d")
         target_obj_sparse_no_rot = label.get("obj_pc_sparse")
+        target_obj_kp21_no_rot = label.get("obj_kp21")
         target_obj_dense_no_rot = label.get("obj_pc_dense")
-        target_obj_center_3d_no_rot = label.get("obj_center_3d")
         target_obj_trans_3d_no_rot = label.get("obj_trans_3d")
 
         target_joints_3d = rot_mat.dot(label["joints_3d"].transpose(1, 0)).transpose()
@@ -364,18 +311,9 @@ class SimpleTransform3DMultiView(SimpleTransformUVD):
             target_obj_pc_dense = rot_mat.dot(label["obj_pc_dense"].transpose(1, 0)).transpose()
             results["target_obj_pc_sparse"] = target_obj_pc_sparse
             results["target_obj_pc_dense"] = target_obj_pc_dense
-            if self._with_obj_occ:
-                obj_sparse_2d_h = target_cam_intr.dot(target_obj_pc_sparse.T).T
-                obj_sparse_z = obj_sparse_2d_h[:, 2:3]
-                obj_sparse_z[np.abs(obj_sparse_z) < 1e-6] = 1e-6
-                obj_sparse_uv = np.concatenate(
-                    [obj_sparse_2d_h[:, 0:1] / obj_sparse_z, obj_sparse_2d_h[:, 1:2] / obj_sparse_z],
-                    axis=-1,
-                ).astype(np.float32)
-                results["target_obj_occupancy"] = self._generate_point_occupancy_map(
-                    obj_sparse_uv,
-                    depth=target_obj_pc_sparse[:, 2],
-                )[None, ...]
+        if label.get("obj_kp21") is not None:
+            target_obj_kp21 = rot_mat.dot(label["obj_kp21"].transpose(1, 0)).transpose()
+            results["target_obj_kp21"] = target_obj_kp21
 
         # 🌟 核心：处理 6D Pose 标签的数据增强旋转
         if label.get("R_label") is not None:
@@ -397,38 +335,9 @@ class SimpleTransform3DMultiView(SimpleTransformUVD):
             results["target_obj_pc_sparse_rest"] = label["obj_pc_sparse_rest"]
             if label.get("obj_pc_eval_rest") is not None:
                 results["target_obj_pc_eval_rest"] = label["obj_pc_eval_rest"]
+            if label.get("obj_kp21_rest") is not None:
+                results["target_obj_kp21_rest"] = label["obj_kp21_rest"]
             results["obj_id"] = label["obj_id"]
-
-        if label.get("obj_center_3d") is not None:
-            # 1. 施加 3D 数据增强旋转
-            target_obj_center_3d = rot_mat.dot(label["obj_center_3d"].transpose(1, 0)).transpose()
-            
-            # 2. 利用增强后的完美相机内参，将 3D 中心点直接透视投影为 2D 坐标！
-            obj_pts_2d = target_cam_intr.dot(target_obj_center_3d.T).T
-            
-            # 透视除法取出 U, V，并保留 Z 深度 (组合成 U, V, D)
-            Z = obj_pts_2d[:, 2:3]
-            Z[np.abs(Z) < 1e-6] = 1e-6
-            
-            U = obj_pts_2d[:, 0:1] / Z
-            V = obj_pts_2d[:, 1:2] / Z
-            
-            obj_uv = np.concatenate([U, V], axis=-1).astype(np.float32)
-            target_obj_center_uv = obj_uv / (np.array([self._output_size[0], self._output_size[1]], dtype=np.float32) / 2) - 1
-            
-            # 计算 obj_center 的可见性
-            if not self._train:
-                target_obj_center_vis = np.ones(1, dtype=np.float32)
-            else:
-                obj_center_2d = obj_uv 
-                target_obj_center_vis = (((obj_center_2d[:, 0] >= 0) & (obj_center_2d[:, 0] < self._output_size[0])) &
-                                         ((obj_center_2d[:, 1] >= 0) & (obj_center_2d[:, 1] < self._output_size[1]))).astype(np.float32)
-
-            results["target_obj_center_3d"] = target_obj_center_3d
-            results["target_obj_center_uv"] = target_obj_center_uv
-            results["target_obj_center_vis"] = target_obj_center_vis
-            if self._with_heatmap:
-                results["target_obj_center_heatmap"] = self._generate_target_heatmap(obj_uv, target_obj_center_vis)
 
         # 🌟 同步旋转 4x4 物体位姿矩阵
         if label.get("obj_transform") is not None:
@@ -453,10 +362,10 @@ class SimpleTransform3DMultiView(SimpleTransformUVD):
             results["target_verts_3d_no_rot"] = target_verts_3d_no_rot
         if target_obj_sparse_no_rot is not None:
             results["target_obj_sparse_no_rot"] = target_obj_sparse_no_rot
+        if target_obj_kp21_no_rot is not None:
+            results["target_obj_kp21_no_rot"] = target_obj_kp21_no_rot
         if target_obj_dense_no_rot is not None:
             results["target_obj_dense_no_rot"] = target_obj_dense_no_rot
-        if target_obj_center_3d_no_rot is not None:
-            results["target_obj_center_3d_no_rot"] = target_obj_center_3d_no_rot
         if target_obj_trans_3d_no_rot is not None:
             results["target_obj_trans_3d_no_rot"] = target_obj_trans_3d_no_rot
 
