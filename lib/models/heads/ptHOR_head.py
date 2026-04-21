@@ -9,8 +9,8 @@ from ...utils.config import CN
 from ...utils.logger import logger
 from ...utils.builder import HEAD
 from ...utils.misc import param_size
-from ...utils.transform import (inverse_sigmoid, batch_cam_extr_transf, batch_cam_intr_projection, bchw_2_bhwc,
-                                denormalize, rot6d_to_rotmat, rotmat_to_rot6d)
+from ...utils.transform import (aa_to_rotmat, inverse_sigmoid, batch_cam_extr_transf, batch_cam_intr_projection,
+                                bchw_2_bhwc, denormalize, rot6d_to_rotmat, rotmat_to_rot6d)
 from ...utils.object_pose_utils import pose_from_keypoints
 from ..bricks.transformer import build_transformer
 from ..bricks.utils import ManoDecoder
