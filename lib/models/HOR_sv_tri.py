@@ -127,6 +127,49 @@ class AttentionPool2d(nn.Module):
         return token, weights.reshape(batch_size, 1, height, width)
 
 
+class ObjectQueryHandReference(nn.Module):
+    def __init__(self, channels, num_heads=4, pooled_hw=8):
+        super().__init__()
+        self.channels = channels
+        self.pooled_hw = int(max(pooled_hw, 2))
+        self.obj_pool = nn.AdaptiveAvgPool2d((self.pooled_hw, self.pooled_hw))
+        self.hand_pool = nn.AdaptiveAvgPool2d((self.pooled_hw, self.pooled_hw))
+        self.obj_norm = nn.LayerNorm(channels)
+        self.hand_norm = nn.LayerNorm(channels)
+        self.cross_attn = nn.MultiheadAttention(channels, num_heads=num_heads, batch_first=True)
+        self.out_proj = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, obj_feat, hand_feat):
+        batch_size, channels, height, width = obj_feat.shape
+        obj_low = self.obj_pool(obj_feat)
+        hand_low = self.hand_pool(hand_feat)
+
+        obj_tokens = obj_low.flatten(2).transpose(1, 2)
+        hand_tokens = hand_low.flatten(2).transpose(1, 2)
+        obj_tokens = self.obj_norm(obj_tokens)
+        hand_tokens = self.hand_norm(hand_tokens)
+
+        ref_tokens, _ = self.cross_attn(query=obj_tokens, key=hand_tokens, value=hand_tokens)
+        ref_feat = ref_tokens.transpose(1, 2).reshape(batch_size, channels, self.pooled_hw, self.pooled_hw)
+        ref_feat = F.interpolate(ref_feat, size=(height, width), mode="bilinear", align_corners=False)
+        ref_feat = self.out_proj(ref_feat)
+        ref_gate = self.gate(torch.cat((obj_feat, ref_feat), dim=1))
+        fused_obj = obj_feat + ref_gate * ref_feat
+        fused_obj = torch.nan_to_num(fused_obj, nan=0.0, posinf=1.0, neginf=-1.0)
+        return fused_obj, ref_gate
+
+
 class ObjectHeatmapHead(nn.Module):
     def __init__(self, channels, num_keypoints):
         super().__init__()
@@ -424,6 +467,16 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
         self.obj_view_rot_weight = cfg.LOSS.get("OBJ_VIEW_ROT_N", 1.0)
         self.obj_view_rot6d_weight = cfg.LOSS.get("OBJ_VIEW_ROT6D_N", 0.05)
         self.obj_view_trans_weight = cfg.LOSS.get("OBJ_VIEW_TRANS_N", self.obj_pose_trans_weight)
+        self.obj_view_points_weight = cfg.LOSS.get("OBJ_VIEW_POINTS_N", self.obj_pose_points_weight)
+        self.stage1_obj_rot6d_l1_scale = float(cfg.LOSS.get("STAGE1_OBJ_ROT6D_L1_SCALE", 0.2))
+        self.stage1_obj_init_rot6d_l1_scale = float(
+            cfg.LOSS.get("STAGE1_OBJ_INIT_ROT6D_L1_SCALE", self.stage1_obj_rot6d_l1_scale)
+        )
+        self.stage1_obj_rot6d_l1_cd_tau_m = float(cfg.LOSS.get("STAGE1_OBJ_ROT6D_L1_CD_TAU_M", 0.01))
+        self.stage1_obj_rot6d_l1_mask_power = float(cfg.LOSS.get("STAGE1_OBJ_ROT6D_L1_MASK_POWER", 1.0))
+        self.stage1_obj_hand_ref_detach = bool(cfg.get("STAGE1_OBJ_HAND_REF_DETACH", True))
+        self.stage1_obj_hand_ref_heads = int(cfg.get("STAGE1_OBJ_HAND_REF_HEADS", 4))
+        self.stage1_obj_hand_ref_pooled_hw = int(cfg.get("STAGE1_OBJ_HAND_REF_POOLED_HW", 8))
         self.conf_tri_hand_tau_px = float(cfg.get("CONF_TRI_HAND_TAU_PX", 24.0))
         self.conf_tri_refine_iters = int(cfg.get("CONF_TRI_REFINE_ITERS", 2))
         self.conf_obj_tau_px = float(cfg.get("CONF_OBJ_TAU_PX", 24.0))
@@ -502,17 +555,10 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
 
         self.hand_pool = nn.AdaptiveAvgPool2d(1)
         self.obj_pool = AttentionPool2d(self.shared_dim, out_dim=self.obj_token_dim)
-        self.hand_from_obj_gate = nn.Sequential(
-            nn.Linear(self.obj_token_dim, self.shared_dim),
-            nn.GELU(),
-            nn.Linear(self.shared_dim, self.shared_dim),
-            nn.Sigmoid(),
-        )
-        self.obj_from_hand_gate = nn.Sequential(
-            nn.Linear(self.shared_dim, self.shared_dim),
-            nn.GELU(),
-            nn.Linear(self.shared_dim, self.shared_dim),
-            nn.Sigmoid(),
+        self.obj_query_hand_ref = ObjectQueryHandReference(
+            channels=self.shared_dim,
+            num_heads=self.stage1_obj_hand_ref_heads,
+            pooled_hw=self.stage1_obj_hand_ref_pooled_hw,
         )
 
         self.hot_pose = HOT(self.shared_dim, self.hot_dim, self.num_hand_joints, 0)
@@ -698,9 +744,9 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
 
     @staticmethod
     def _build_object_points_from_pose(obj_points_rest, rot6d, trans_abs):
-        obj_points_rest = torch.nan_to_num(obj_points_rest.detach(), nan=0.0, posinf=10.0, neginf=-10.0).float()
-        rot6d = torch.nan_to_num(rot6d.detach(), nan=0.0, posinf=10.0, neginf=-10.0).float()
-        trans_abs = torch.nan_to_num(trans_abs.detach(), nan=0.0, posinf=10.0, neginf=-10.0).float()
+        obj_points_rest = torch.nan_to_num(obj_points_rest, nan=0.0, posinf=10.0, neginf=-10.0).float()
+        rot6d = torch.nan_to_num(rot6d, nan=0.0, posinf=10.0, neginf=-10.0).float()
+        trans_abs = torch.nan_to_num(trans_abs, nan=0.0, posinf=10.0, neginf=-10.0).float()
         if rot6d.dim() == 2:
             if obj_points_rest.dim() == 4:
                 obj_points_rest = obj_points_rest[:, 0]
@@ -729,6 +775,23 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
             gt_rot6d.to(device=device, dtype=dtype),
             gt_trans.to(device=device, dtype=dtype),
         )
+
+    @staticmethod
+    def _bidirectional_chamfer_distance(pred_points, target_points):
+        pred_points = torch.nan_to_num(pred_points, nan=0.0, posinf=10.0, neginf=-10.0).float()
+        target_points = torch.nan_to_num(target_points, nan=0.0, posinf=10.0, neginf=-10.0).float()
+        pairwise = torch.cdist(pred_points, target_points)
+        pred_to_target = pairwise.min(dim=-1)[0].mean(dim=-1)
+        target_to_pred = pairwise.min(dim=-2)[0].mean(dim=-1)
+        return 0.5 * (pred_to_target + target_to_pred)
+
+    def _stage1_rot6d_l1_weight(self, chamfer_m):
+        tau = max(float(self.stage1_obj_rot6d_l1_cd_tau_m), 1e-6)
+        weight = (chamfer_m / tau).clamp_(0.0, 1.0)
+        power = max(float(self.stage1_obj_rot6d_l1_mask_power), 1e-6)
+        if abs(power - 1.0) > 1e-6:
+            weight = weight.pow(power)
+        return weight
 
     def _build_pred_object_points_for_eval(self, preds, batch):
         dtype = preds["mano_3d_mesh_sv"].dtype
@@ -1076,14 +1139,9 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
         shared_feat_stage2 = shared_feat.view(batch_size, num_cams, self.shared_dim, shared_feat.shape[-2], shared_feat.shape[-1])
         hand_feat = self.hand_adapter(shared_feat)
         obj_feat = self.obj_adapter(shared_feat)
-
-        hand_global = self.hand_pool(hand_feat).flatten(1)
-        obj_token_seed, obj_attn_map = self.obj_pool(obj_feat)
-        hand_gate = self.hand_from_obj_gate(obj_token_seed).view(bn, self.shared_dim, 1, 1)
-        obj_gate = self.obj_from_hand_gate(hand_global).view(bn, self.shared_dim, 1, 1)
-        hand_feat = hand_feat * (1.0 + hand_gate)
-        obj_feat = obj_feat * (1.0 + obj_gate)
         obj_feat, obj_id_embed = self._apply_object_identity_conditioning(obj_feat, batch, batch_size, num_cams)
+        hand_ref_memory = hand_feat.detach() if self.stage1_obj_hand_ref_detach else hand_feat
+        obj_feat, obj_hand_ref_gate = self.obj_query_hand_ref(obj_feat, hand_ref_memory)
 
         hand_tokens = self.hot_pose(hand_feat)
         hand_att0 = self.att_0(hand_tokens)
@@ -1232,6 +1290,13 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
             "hand_context": hand_context,
             "obj_token": obj_token,
             "obj_attn_map": obj_attn_map,
+            "obj_hand_ref_gate": obj_hand_ref_gate.view(
+                batch_size,
+                num_cams,
+                self.shared_dim,
+                obj_hand_ref_gate.shape[-2],
+                obj_hand_ref_gate.shape[-1],
+            ),
             "obj_id_embed": obj_id_embed,
         }
         interaction_mode = kwargs.get("interaction_mode", self._stage_to_interaction_mode(self.current_stage_name))
@@ -1422,6 +1487,7 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
         loss_obj_view_rot_geo = pred_mano_3d_mesh_sv.new_tensor(0.0)
         loss_obj_view_rot_l1 = pred_mano_3d_mesh_sv.new_tensor(0.0)
         loss_obj_view_trans = pred_mano_3d_mesh_sv.new_tensor(0.0)
+        loss_obj_view_points = pred_mano_3d_mesh_sv.new_tensor(0.0)
         loss_obj_view_rot = pred_mano_3d_mesh_sv.new_tensor(0.0)
         loss_obj_rot_geo = pred_mano_3d_mesh_sv.new_tensor(0.0)
         loss_obj_rot_l1 = pred_mano_3d_mesh_sv.new_tensor(0.0)
@@ -1487,11 +1553,60 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
             loss_obj_view_rot_geo = torch.mean(
                 self.rotation_geodesic(pred_obj_view_rot6d_master.reshape(-1, 6), target_view_rot.reshape(-1, 6))
             ) * self.obj_view_rot_weight
-            loss_obj_view_rot_l1 = self.coord_loss(pred_obj_view_rot6d_master, target_view_rot) * self.obj_view_rot6d_weight
         if pred_obj_view_trans_master is not None and master_obj_trans_gt is not None:
             target_view_trans = master_obj_trans_gt.unsqueeze(1).expand_as(pred_obj_view_trans_master)
             loss_obj_view_trans = self.coord_loss(pred_obj_view_trans_master, target_view_trans) * self.obj_view_trans_weight
-        loss_obj_view_rot = loss_obj_view_rot_geo + loss_obj_view_rot_l1 + loss_obj_view_trans
+        hand_root_master = None
+        if preds.get("ref_hand", None) is not None:
+            hand_root_master = preds["ref_hand"][:, self.center_idx, :]
+        if (
+            preds.get("obj_points_cam", None) is not None
+            and gt.get("target_obj_pc_sparse", None) is not None
+        ):
+            pred_obj_points_cam = preds["obj_points_cam"].to(device=pred_mano_3d_mesh_sv.device, dtype=pred_mano_3d_mesh_sv.dtype)
+            gt_obj_points_cam = gt["target_obj_pc_sparse"].to(device=pred_mano_3d_mesh_sv.device, dtype=pred_mano_3d_mesh_sv.dtype)
+            view_cd = self._bidirectional_chamfer_distance(
+                pred_obj_points_cam.flatten(0, 1),
+                gt_obj_points_cam.flatten(0, 1),
+            ).view(pred_obj_points_cam.shape[0], pred_obj_points_cam.shape[1])
+            loss_obj_view_points = view_cd.mean() * self.obj_view_points_weight
+            if pred_obj_view_rot6d_master is not None and master_obj_rot6d_gt is not None:
+                target_view_rot = master_obj_rot6d_gt.unsqueeze(1).expand_as(pred_obj_view_rot6d_master)
+                view_rot_l1 = torch.abs(pred_obj_view_rot6d_master - target_view_rot).mean(dim=-1)
+                view_rot_l1_weight = self._stage1_rot6d_l1_weight(view_cd.detach())
+                loss_obj_view_rot_l1 = (
+                    (view_rot_l1 * view_rot_l1_weight).sum() / (view_rot_l1_weight.sum() + 1e-6)
+                ) * self.obj_view_rot6d_weight * self.stage1_obj_rot6d_l1_scale
+        elif pred_obj_view_rot6d_master is not None and master_obj_rot6d_gt is not None:
+            target_view_rot = master_obj_rot6d_gt.unsqueeze(1).expand_as(pred_obj_view_rot6d_master)
+            loss_obj_view_rot_l1 = (
+                self.coord_loss(pred_obj_view_rot6d_master, target_view_rot)
+                * self.obj_view_rot6d_weight
+                * self.stage1_obj_rot6d_l1_scale
+            )
+
+        if (
+            pred_obj_init_rot6d is not None
+            and pred_obj_init_trans is not None
+            and master_obj_rot6d_gt is not None
+            and master_obj_trans_gt is not None
+            and master_obj_sparse_gt is not None
+            and hand_root_master is not None
+        ):
+            obj_rest_master = gt["master_obj_sparse_rest"].to(device=pred_mano_3d_mesh_sv.device, dtype=pred_mano_3d_mesh_sv.dtype)
+            pred_obj_init_abs = hand_root_master + pred_obj_init_trans
+            gt_obj_init_abs = hand_root_master + master_obj_trans_gt
+            pred_init_points = self._build_object_points_from_pose(obj_rest_master, pred_obj_init_rot6d, pred_obj_init_abs)
+            gt_init_points = self._build_object_points_from_pose(obj_rest_master, master_obj_rot6d_gt, gt_obj_init_abs)
+            init_cd = self._bidirectional_chamfer_distance(pred_init_points, gt_init_points)
+            init_rot_l1 = torch.abs(pred_obj_init_rot6d - master_obj_rot6d_gt).mean(dim=-1)
+            init_rot_l1_weight = self._stage1_rot6d_l1_weight(init_cd.detach())
+            loss_obj_init_rot_l1 = (
+                (init_rot_l1 * init_rot_l1_weight).sum() / (init_rot_l1_weight.sum() + 1e-6)
+            ) * self.obj_init_rot6d_weight * self.stage1_obj_init_rot6d_l1_scale
+            loss_obj_init_rot = loss_obj_init_rot_geo + loss_obj_init_rot_l1
+
+        loss_obj_view_rot = loss_obj_view_rot_geo + loss_obj_view_rot_l1 + loss_obj_view_trans + loss_obj_view_points
 
         if (
             stage_name == "stage2"
@@ -1509,7 +1624,8 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
             loss_obj_rot_l1 = self.coord_loss(final_obj_rot6d, master_obj_rot6d_gt) * self.obj_pose_rot6d_weight * obj_warmup
             loss_obj_rot = loss_obj_rot_geo + loss_obj_rot_l1
             loss_obj_trans = self.coord_loss(final_obj_trans, master_obj_trans_gt) * self.obj_pose_trans_weight * obj_warmup
-            loss_obj_points = self.coord_loss(final_obj_points, master_obj_sparse_gt) * self.obj_pose_points_weight * obj_warmup
+            final_cd = self._bidirectional_chamfer_distance(final_obj_points, master_obj_sparse_gt)
+            loss_obj_points = final_cd.mean() * self.obj_pose_points_weight * obj_warmup
             loss_obj_pose = loss_obj_rot + loss_obj_trans + loss_obj_points
 
         total_loss = (
@@ -1549,6 +1665,7 @@ class POEM_SV_Tri(nn.Module, ModuleAbstract):
             "loss_obj_view_rot_geo": loss_obj_view_rot_geo,
             "loss_obj_view_rot_l1": loss_obj_view_rot_l1,
             "loss_obj_view_trans": loss_obj_view_trans,
+            "loss_obj_view_points": loss_obj_view_points,
             "loss_obj_rot": loss_obj_rot,
             "loss_obj_rot_geo": loss_obj_rot_geo,
             "loss_obj_rot_l1_aux": loss_obj_rot_l1,

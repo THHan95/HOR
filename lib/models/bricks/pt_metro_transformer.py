@@ -139,19 +139,13 @@ class point_METRO_block(BertPreTrainedModel):
         return pt_updated_hand_xyz, updated_hand_feats, updated_obj_xyz, updated_obj_feats
 
     def _forward_mesh_obj(self, hand_xyz, hand_feats, obj_xyz, obj_feats):
-        updated_hand_feats, pt_updated_hand_xyz = self.hand_update_layer(
-            query_feats=hand_feats,
-            query_xyz=hand_xyz,
-            key_feats=obj_feats,
-            key_xyz=obj_xyz,
-        )
         updated_obj_feats, updated_obj_xyz = self.obj_update_layer(
             query_feats=obj_feats,
             query_xyz=obj_xyz,
-            key_feats=updated_hand_feats,
-            key_xyz=pt_updated_hand_xyz,
+            key_feats=hand_feats,
+            key_xyz=hand_xyz,
         )
-        return pt_updated_hand_xyz, updated_hand_feats, updated_obj_xyz, updated_obj_feats
+        return hand_xyz, hand_feats, updated_obj_xyz, updated_obj_feats
 
     def _forward_hand(self, hand_xyz, hand_feats, obj_xyz, obj_feats):
         updated_hand_feats, pt_updated_hand_xyz = self.hand_update_layer(

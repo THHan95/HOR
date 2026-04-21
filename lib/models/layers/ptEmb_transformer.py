@@ -10,6 +10,7 @@ from ...utils.builder import TRANSFORMER
 from ...utils.net_utils import xavier_init
 from ...utils.transform import inverse_sigmoid
 from ...utils.object_pose_utils import pose_from_keypoints
+from ...utils.transform import aa_to_rotmat, rot6d_to_rotmat, rotmat_to_rot6d
 from ...utils.logger import logger
 from ...utils.misc import param_size
 from ...utils.points_utils import index_points
@@ -46,6 +47,8 @@ class HORHandObjectContext:
     obj_feat_fuser: nn.Module
     hand_update_scale: float
     obj_feat_update_scale: float
+    obj_pose_update_scale: float
+    obj_update_mode: str
 
 
 @dataclass
@@ -186,6 +189,20 @@ class _HORTRBase(nn.Module):
         self.num_hidden_layers = cfg.NUM_HIDDEN_LAYERS
         self.num_attention_heads = cfg.NUM_ATTENTION_HEADS
         self.obj_xyz_update_scale = cfg.get("OBJ_XYZ_UPDATE_SCALE", 0.0)
+        self.stage2_obj_update_mode = str(cfg.get("STAGE2_OBJ_UPDATE_MODE", "point")).lower()
+        self.stage2_obj_vote_rot_scale = float(cfg.get("STAGE2_OBJ_VOTE_ROT_SCALE", 0.05))
+        self.stage2_obj_vote_trans_scale = float(cfg.get("STAGE2_OBJ_VOTE_TRANS_SCALE", 0.05))
+        vote_input_dim = (self.input_feat_dim * 2) + 6
+        self.obj_rigid_vote_head = nn.Sequential(
+            nn.Linear(vote_input_dim, self.input_feat_dim),
+            nn.ReLU(),
+            nn.Linear(self.input_feat_dim, 6),
+        )
+        self.obj_rigid_weight_head = nn.Sequential(
+            nn.Linear(vote_input_dim, self.input_feat_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.input_feat_dim // 2, 1),
+        )
 
         # Configuration for PT part
         self.nneighbor = cfg.N_NEIGHBOR
@@ -263,6 +280,64 @@ class _HORTRBase(nn.Module):
                 x = torch.where(finite_mask, x, fallback)
         return self._sanitize_tensor(x, abs_max, nan_value=nan_value)
 
+    def _apply_rigid_vote_update(
+        self,
+        prev_obj_xyz,
+        blended_obj_xyz,
+        prev_obj_feats,
+        blended_obj_feats,
+        current_rot6d,
+        current_trans_norm,
+        obj_template,
+        hand_center_point,
+        build_object_points_from_pose_fn,
+        obj_pose_update_scale,
+        obj_xyz_norm_abs_max,
+    ):
+        rel_xyz = self._sanitize_tensor(
+            prev_obj_xyz - prev_obj_xyz.mean(dim=1, keepdim=True),
+            obj_xyz_norm_abs_max,
+        )
+        motion_xyz = self._sanitize_tensor(
+            blended_obj_xyz - prev_obj_xyz,
+            self.stage2_obj_vote_trans_scale * 4.0,
+        )
+        vote_input = torch.cat((prev_obj_feats, blended_obj_feats, rel_xyz, motion_xyz), dim=-1)
+        vote_raw = self._sanitize_tensor(self.obj_rigid_vote_head(vote_input), 10.0)
+        vote_weight_logits = self._sanitize_tensor(self.obj_rigid_weight_head(vote_input), 10.0).squeeze(-1)
+        vote_weights = torch.softmax(vote_weight_logits, dim=1).unsqueeze(-1)
+
+        trans_scale = max(self.stage2_obj_vote_trans_scale, 1e-6)
+        rot_scale = max(self.stage2_obj_vote_rot_scale, 1e-6)
+        motion_prior = torch.tanh(motion_xyz / trans_scale) * trans_scale
+        rot_motion = torch.cross(rel_xyz, motion_xyz, dim=-1)
+        rot_prior = torch.tanh(rot_motion / rot_scale) * rot_scale
+        trans_votes = motion_prior + (torch.tanh(vote_raw[..., :3]) * trans_scale)
+        rot_votes = rot_prior + (torch.tanh(vote_raw[..., 3:]) * rot_scale)
+
+        delta_trans_norm = torch.sum(vote_weights * trans_votes, dim=1) * obj_pose_update_scale
+        delta_rot_aa = torch.sum(vote_weights * rot_votes, dim=1) * obj_pose_update_scale
+        delta_rotmat = aa_to_rotmat(delta_rot_aa.reshape(-1, 3)).view(*current_rot6d.shape[:-1], 3, 3)
+        current_rotmat = rot6d_to_rotmat(current_rot6d.reshape(-1, 6)).view(*current_rot6d.shape[:-1], 3, 3)
+        updated_rotmat = torch.matmul(delta_rotmat.to(dtype=current_rotmat.dtype), current_rotmat)
+        updated_rot6d = rotmat_to_rot6d(updated_rotmat.reshape(-1, 3, 3)).view_as(current_rot6d)
+        updated_rot6d = self._stabilize_tensor(updated_rot6d, 10.0, fallback=current_rot6d)
+        updated_trans_norm = self._stabilize_tensor(current_trans_norm + delta_trans_norm, 10.0, fallback=current_trans_norm)
+        updated_obj_xyz_norm, updated_obj_xyz_master, _, updated_obj_trans = build_object_points_from_pose_fn(
+            obj_template,
+            hand_center_point,
+            updated_rot6d,
+            updated_trans_norm,
+        )
+        updated_obj_xyz_norm = self._stabilize_tensor(updated_obj_xyz_norm, obj_xyz_norm_abs_max, fallback=prev_obj_xyz)
+        updated_obj_xyz_master = self._stabilize_tensor(
+            updated_obj_xyz_master,
+            obj_xyz_norm_abs_max * 0.2,
+            fallback=(prev_obj_xyz * 0.2) + hand_center_point,
+        )
+        updated_obj_trans = self._stabilize_tensor(updated_obj_trans, 10.0, fallback=current_trans_norm * 0.2)
+        return updated_obj_xyz_norm, updated_obj_xyz_master, updated_rot6d, updated_trans_norm, updated_obj_trans
+
     def _forward_hand_anchor(self, query_xyz, query_feat, pt_xyz, pt_feats, hand_refine_context):
         hand_xyz_norm_abs_max = 25.0
         hand_xyz_master_abs_max = 5.0
@@ -316,6 +391,8 @@ class _HORTRBase(nn.Module):
         obj_feat_fuser = hand_object_context.obj_feat_fuser
         hand_update_scale = hand_object_context.hand_update_scale
         obj_feat_update_scale = hand_object_context.obj_feat_update_scale
+        obj_pose_update_scale = hand_object_context.obj_pose_update_scale
+        obj_update_mode = hand_object_context.obj_update_mode
 
         hand_xyz_norm_abs_max = 25.0
         hand_xyz_master_abs_max = 5.0
@@ -383,29 +460,45 @@ class _HORTRBase(nn.Module):
 
             current_hand_xyz = prev_hand_xyz + hand_update_scale * (next_hand_xyz - prev_hand_xyz)
             current_hand_feats = prev_hand_feats + hand_update_scale * (next_hand_feats - prev_hand_feats)
-            current_obj_xyz_norm = prev_obj_xyz + obj_feat_update_scale * (next_obj_xyz - prev_obj_xyz)
+            blended_obj_xyz = prev_obj_xyz + obj_feat_update_scale * (next_obj_xyz - prev_obj_xyz)
             current_obj_feats = prev_obj_feats + obj_feat_update_scale * (next_obj_feats - prev_obj_feats)
             self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "current_hand_xyz", current_hand_xyz)
             self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "current_hand_feats", current_hand_feats)
-            self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "current_obj_xyz_norm", current_obj_xyz_norm)
+            self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "blended_obj_xyz", blended_obj_xyz)
             self._log_nonfinite_tensor("NonFiniteHandMeshObj", layer_idx, "current_obj_feats", current_obj_feats)
             current_hand_xyz = self._stabilize_tensor(current_hand_xyz, hand_xyz_norm_abs_max, fallback=prev_hand_xyz)
             current_hand_feats = self._stabilize_tensor(current_hand_feats, feat_abs_max, fallback=prev_hand_feats)
-            current_obj_xyz_norm = self._stabilize_tensor(current_obj_xyz_norm, obj_xyz_norm_abs_max, fallback=prev_obj_xyz)
             current_obj_feats = self._stabilize_tensor(current_obj_feats, feat_abs_max, fallback=prev_obj_feats)
+            blended_obj_xyz = self._stabilize_tensor(blended_obj_xyz, obj_xyz_norm_abs_max, fallback=prev_obj_xyz)
 
-            current_obj_xyz_master = self._sanitize_tensor(
-                (current_obj_xyz_norm * 0.2) + hand_center_point,
-                obj_xyz_norm_abs_max * 0.2,
-            )
-            pose_dict = pose_from_keypoints(
-                rest_points=obj_template,
-                pred_points=current_obj_xyz_master,
-                hand_root=hand_center_point.squeeze(-2),
-            )
-            current_rot6d = self._stabilize_tensor(pose_dict["rot6d"], 10.0)
-            current_obj_trans = self._stabilize_tensor(pose_dict["trans_rel"], 10.0)
-            current_trans_norm = self._stabilize_tensor(current_obj_trans / 0.2, 10.0)
+            if obj_update_mode == "rigid_vote":
+                current_obj_xyz_norm, current_obj_xyz_master, current_rot6d, current_trans_norm, current_obj_trans = self._apply_rigid_vote_update(
+                    prev_obj_xyz=prev_obj_xyz,
+                    blended_obj_xyz=blended_obj_xyz,
+                    prev_obj_feats=prev_obj_feats,
+                    blended_obj_feats=current_obj_feats,
+                    current_rot6d=current_rot6d,
+                    current_trans_norm=current_trans_norm,
+                    obj_template=obj_template,
+                    hand_center_point=hand_center_point,
+                    build_object_points_from_pose_fn=build_object_points_from_pose_fn,
+                    obj_pose_update_scale=obj_pose_update_scale,
+                    obj_xyz_norm_abs_max=obj_xyz_norm_abs_max,
+                )
+            else:
+                current_obj_xyz_norm = blended_obj_xyz
+                current_obj_xyz_master = self._sanitize_tensor(
+                    (current_obj_xyz_norm * 0.2) + hand_center_point,
+                    obj_xyz_norm_abs_max * 0.2,
+                )
+                pose_dict = pose_from_keypoints(
+                    rest_points=obj_template,
+                    pred_points=current_obj_xyz_master,
+                    hand_root=hand_center_point.squeeze(-2),
+                )
+                current_rot6d = self._stabilize_tensor(pose_dict["rot6d"], 10.0)
+                current_obj_trans = self._stabilize_tensor(pose_dict["trans_rel"], 10.0)
+                current_trans_norm = self._stabilize_tensor(current_obj_trans / 0.2, 10.0)
 
             all_hand_mesh_xyz_master.append(
                 self._sanitize_tensor((current_hand_xyz * 0.2) + hand_center_point, hand_xyz_master_abs_max)
@@ -414,11 +507,38 @@ class _HORTRBase(nn.Module):
             all_obj_rot6d.append(current_rot6d)
             all_obj_trans.append(current_obj_trans)
 
+        all_hand_mesh_xyz_master = torch.stack(all_hand_mesh_xyz_master)
+        all_obj_xyz_master = torch.stack(all_obj_xyz_master)
+        if hand_center_point.dim() == all_obj_xyz_master.dim():
+            hand_root = hand_center_point.squeeze(-2)
+        else:
+            expand_shape = list(all_obj_xyz_master.shape[:-2]) + [3]
+            hand_root = hand_center_point.squeeze(-2).view(
+                *([1] * (all_obj_xyz_master.dim() - hand_center_point.dim())),
+                *hand_center_point.squeeze(-2).shape,
+            )
+            hand_root = hand_root.expand(*expand_shape)
+        pose_dict = pose_from_keypoints(
+            rest_points=obj_template,
+            pred_points=all_obj_xyz_master,
+            hand_root=hand_root,
+        )
+        geom_obj_rot6d = self._stabilize_tensor(
+            pose_dict["rot6d"],
+            10.0,
+            fallback=torch.stack(all_obj_rot6d),
+        )
+        geom_obj_trans = self._stabilize_tensor(
+            pose_dict["trans_rel"],
+            10.0,
+            fallback=torch.stack(all_obj_trans),
+        )
+
         return HORMeshObjOutput(
-            all_hand_mesh_xyz_master=torch.stack(all_hand_mesh_xyz_master),
-            all_obj_xyz_master=torch.stack(all_obj_xyz_master),
-            all_obj_rot6d=torch.stack(all_obj_rot6d),
-            all_obj_trans=torch.stack(all_obj_trans),
+            all_hand_mesh_xyz_master=all_hand_mesh_xyz_master,
+            all_obj_xyz_master=all_obj_xyz_master,
+            all_obj_rot6d=geom_obj_rot6d,
+            all_obj_trans=geom_obj_trans,
             final_hand_mesh_xyz_norm=self._sanitize_tensor(current_hand_xyz, hand_xyz_norm_abs_max),
             final_hand_mesh_feats_norm=current_hand_feats,
         )
