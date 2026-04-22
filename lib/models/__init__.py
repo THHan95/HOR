@@ -12,5 +12,7 @@ from .POEM import PtEmbedMultiviewStereo
 from .HOR import POEM_RLE
 from .HOR_heatmap import POEM_Heatmap
 from .HOR_heatmap_centerrot import POEM_HeatmapCenterRot
+from .HOR_heatmap_centerrot_slim import POEM_HeatmapCenterRotSlim
+from .HOR_sv_hopregnet import POEM_SV_HOPRegNet
 from .HOR_sv_tri import POEM_SV_Tri
 from .HOR_sv_init_cpf import POEM_SV_InitCPF

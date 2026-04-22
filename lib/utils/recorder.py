@@ -34,9 +34,16 @@ class Recorder:
         time_f: Optional[float] = None,
         eval_only: bool = False,
     ):
+        self.git_state = self.get_git_state()
+        allow_dirty_git = bool(cfg.TRAIN.get("ALLOW_DIRTY_GIT", False))
         if not eval_only:
-            assert exp_id in ["default", "debug"] or self.get_git_commit(), "MUST commit before the experiment!"
+            assert (
+                exp_id in ["default", "debug"]
+                or self.git_state["is_clean"]
+                or allow_dirty_git
+            ), "MUST commit before the experiment!"
         self.eval_only = eval_only
+        self.allow_dirty_git = allow_dirty_git
         self.timestamp = time.strftime("%Y_%m%d_%H%M_%S", time.localtime(time_f if time_f else time.time()))
         self.exp_id = exp_id
         self.cfg = cfg
@@ -57,7 +64,30 @@ class Recorder:
         logger.set_log_file(path=self.dump_path, name=f"{self.exp_id}_{self.timestamp}")
         logger.info(f"run command: {' '.join(sys.argv)}")
         if not self.eval_only and self.exp_id not in ["default", "debug"]:
-            logger.info(f"git commit: {self.get_git_commit()}")
+            logger.info(f"git commit: {self.git_state['commit']}")
+        if not self.git_state["is_clean"]:
+            dirty_msg = (
+                f"dirty git worktree allowed={self.allow_dirty_git} "
+                f"modified={len(self.git_state['modified_files'])} "
+                f"staged={len(self.git_state['staged_files'])} "
+                f"untracked={len(self.git_state['untracked_files'])}"
+            )
+            if self.allow_dirty_git:
+                logger.warning(dirty_msg)
+                if self.git_state["modified_files"]:
+                    logger.warning(f"modified_files: {' '.join(self.git_state['modified_files'])}")
+                if self.git_state["staged_files"]:
+                    logger.warning(f"staged_files: {' '.join(self.git_state['staged_files'])}")
+                if self.git_state["untracked_files"]:
+                    logger.warning(f"untracked_files: {' '.join(self.git_state['untracked_files'])}")
+            else:
+                logger.error(dirty_msg)
+                if self.git_state["modified_files"]:
+                    logger.error(f"modified_files: {' '.join(self.git_state['modified_files'])}")
+                if self.git_state["staged_files"]:
+                    logger.error(f"staged_files: {' '.join(self.git_state['staged_files'])}")
+                if self.git_state["untracked_files"]:
+                    logger.error(f"untracked_files: {' '.join(self.git_state['untracked_files'])}")
         with open(os.path.join(self.dump_path, "dump_cfg.yaml"), "w") as f:
             f.write(self.cfg.dump(sort_keys=False))
         f.close()
@@ -159,7 +189,7 @@ class Recorder:
             f.write("\n")
 
     @staticmethod
-    def get_git_commit() -> Optional[str]:
+    def get_git_state() -> Dict[str, Union[Optional[str], List[str], bool]]:
         # get current git report
         proj_root = os.environ.get("PROJECT_ROOT")
         if proj_root is not None:
@@ -170,13 +200,12 @@ class Recorder:
         modified_files = [item.a_path for item in repo.index.diff(None)]
         staged_files = [item.a_path for item in repo.index.diff("HEAD")]
         untracked_files = repo.untracked_files
+        is_clean = not (len(modified_files) or len(staged_files) or len(untracked_files))
 
-        if len(modified_files):
-            logger.error(f"modified_files: {' '.join(modified_files)}")
-        if len(staged_files):
-            logger.error(f"staged_files: {' '.join(staged_files)}")
-        if len(untracked_files):
-            logger.error(f"untracked_files: {' '.join(untracked_files)}")
-
-        return (repo.head.commit.hexsha
-                if not (len(modified_files) or len(staged_files) or len(untracked_files)) else None)
+        return {
+            "commit": repo.head.commit.hexsha,
+            "modified_files": modified_files,
+            "staged_files": staged_files,
+            "untracked_files": untracked_files,
+            "is_clean": is_clean,
+        }

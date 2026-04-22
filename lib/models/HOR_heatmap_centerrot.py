@@ -207,6 +207,8 @@ class POEM_HeatmapCenterRot(nn.Module, ModuleAbstract):
         self.obj_chamfer_weight = cfg.LOSS.get("OBJ_CHAMFER_N", 5.0)
         self.obj_emd_weight = cfg.LOSS.get("OBJ_EMD_N", 1.0)
         self.obj_sym_corner_weight = cfg.LOSS.get("OBJ_SYM_CORNER_N", 1.0)
+        self.obj_corner_proj_weight = cfg.LOSS.get("OBJ_CORNER_PROJ_N", 0.0)
+        self.obj_corner_3d_weight = cfg.LOSS.get("OBJ_CORNER_3D_N", 0.0)
         self.obj_sym_max_disc_step = float(cfg.LOSS.get("OBJ_SYM_MAX_DISC_STEP", 0.01))
         self.obj_penetration_weight = cfg.LOSS.get("OBJ_PENETRATION_N", 5.0)
         self.obj_direct_pose_aux_scale = float(cfg.LOSS.get("OBJ_DIRECT_POSE_AUX_SCALE", 0.1))
@@ -1076,6 +1078,49 @@ class POEM_HeatmapCenterRot(nn.Module, ModuleAbstract):
                 hand_root = hand_root.unsqueeze(1)
             center = hand_root + trans_rel.unsqueeze(-2)
         return cls._build_object_points_from_pose(obj_points_rest, rot6d, center)
+
+    @staticmethod
+    def _build_object_points_from_pose_grad(obj_points_rest, rot6d, center):
+        obj_points_rest = torch.nan_to_num(obj_points_rest, nan=0.0, posinf=10.0, neginf=-10.0).float()
+        rot6d = torch.nan_to_num(rot6d, nan=0.0, posinf=10.0, neginf=-10.0).float()
+        center = torch.nan_to_num(center, nan=0.0, posinf=10.0, neginf=-10.0).float()
+
+        if rot6d.dim() == 2:
+            rotmat = rot6d_to_rotmat(rot6d)
+            return torch.matmul(obj_points_rest, rotmat.transpose(1, 2)) + center.unsqueeze(1)
+
+        batch_size, num_cams = rot6d.shape[:2]
+        rotmat = rot6d_to_rotmat(rot6d.reshape(-1, 6)).view(batch_size, num_cams, 3, 3)
+        points = obj_points_rest.unsqueeze(1).expand(-1, num_cams, -1, -1)
+        if center.dim() == 3:
+            center = center.unsqueeze(1)
+        return torch.matmul(points, rotmat.transpose(-1, -2)) + center
+
+    @classmethod
+    def _build_object_points_from_hand_pose_grad(cls, obj_points_rest, rot6d, hand_root, trans_rel):
+        hand_root = torch.nan_to_num(hand_root, nan=0.0, posinf=10.0, neginf=-10.0).float()
+        trans_rel = torch.nan_to_num(trans_rel, nan=0.0, posinf=10.0, neginf=-10.0).float()
+        if rot6d.dim() == 2:
+            if hand_root.dim() == 3 and hand_root.shape[-2] == 1:
+                hand_root = hand_root.squeeze(-2)
+            center = hand_root + trans_rel
+        else:
+            if hand_root.dim() == 3:
+                hand_root = hand_root.unsqueeze(1)
+            center = hand_root + trans_rel.unsqueeze(-2)
+        return cls._build_object_points_from_pose_grad(obj_points_rest, rot6d, center)
+
+    @staticmethod
+    def _masked_points_3d_loss(pred_points, gt_points, valid_mask, loss_type="l1"):
+        gt_valid = torch.isfinite(gt_points).all(dim=-1)
+        pred_points = torch.nan_to_num(pred_points, nan=0.0, posinf=10.0, neginf=-10.0)
+        gt_points = torch.nan_to_num(gt_points, nan=0.0, posinf=10.0, neginf=-10.0)
+        valid = valid_mask.to(dtype=pred_points.dtype) * gt_valid.to(dtype=pred_points.dtype)
+        if loss_type == "l2":
+            point_loss = torch.sum((pred_points - gt_points) ** 2, dim=-1)
+        else:
+            point_loss = torch.sum(torch.abs(pred_points - gt_points), dim=-1)
+        return (point_loss * valid).sum() / (valid.sum() + 1e-9)
 
     def _log_visualizations(self, mode, batch, preds, step_idx, stage_name):
         img = batch["image"]
@@ -1956,6 +2001,59 @@ class POEM_HeatmapCenterRot(nn.Module, ModuleAbstract):
             + loss_obj_view_rot_self_geo
             + loss_obj_view_rot_self_l1
         )
+        loss_obj_corner_proj_stage1 = pred_mano_3d_mesh_sv.new_tensor(0.0)
+        loss_obj_corner_3d_stage1 = pred_mano_3d_mesh_sv.new_tensor(0.0)
+
+        master_obj_corner_rest = None
+        gt_sv_corners_3d = None
+        gt_sv_corners_2d = None
+        gt_sv_corner_valid = None
+        gt_master_corners_3d = None
+        gt_master_corner_valid = None
+        if master_obj_kp21_gt is not None:
+            gt_master_corners_3d = master_obj_kp21_gt[:, :8].to(device=pred_mano_3d_mesh_sv.device, dtype=pred_mano_3d_mesh_sv.dtype)
+            gt_master_corner_valid = torch.isfinite(gt_master_corners_3d).all(dim=-1) & (gt_master_corners_3d[..., 2] > 1e-6)
+        if target_obj_kp21_gt is not None:
+            gt_sv_corners_3d = target_obj_kp21_gt[:, :, :8].to(device=pred_mano_3d_mesh_sv.device, dtype=pred_mano_3d_mesh_sv.dtype)
+            gt_sv_corners_2d = batch_cam_intr_projection(
+                gt["target_cam_intr"].to(device=pred_mano_3d_mesh_sv.device, dtype=pred_mano_3d_mesh_sv.dtype),
+                gt_sv_corners_3d,
+            )
+            gt_sv_corner_valid = torch.isfinite(gt_sv_corners_2d).all(dim=-1) & (gt_sv_corners_3d[..., 2] > 1e-6)
+        if gt.get("master_obj_kp21_rest", None) is not None:
+            master_obj_corner_rest = gt["master_obj_kp21_rest"][:, :8].to(device=pred_mano_3d_mesh_sv.device, dtype=pred_mano_3d_mesh_sv.dtype)
+
+        if (
+            master_obj_corner_rest is not None
+            and preds.get("obj_view_rot6d_cam", None) is not None
+            and preds.get("obj_view_trans", None) is not None
+            and gt_sv_corners_3d is not None
+        ):
+            pred_sv_corners = self._build_object_points_from_hand_pose_grad(
+                master_obj_corner_rest,
+                preds["obj_view_rot6d_cam"],
+                pred_ref_hand_root_views,
+                preds["obj_view_trans"],
+            )
+            if self.obj_corner_proj_weight > 0.0 and gt_sv_corners_2d is not None:
+                pred_sv_corners_2d = batch_cam_intr_projection(
+                    gt["target_cam_intr"].to(device=pred_sv_corners.device, dtype=pred_sv_corners.dtype),
+                    pred_sv_corners,
+                )
+                pred_sv_corners_2d = torch.nan_to_num(pred_sv_corners_2d, nan=0.0, posinf=img_scale, neginf=-img_scale)
+                gt_sv_corners_2d_safe = torch.nan_to_num(gt_sv_corners_2d, nan=0.0, posinf=img_scale, neginf=-img_scale)
+                corner_proj_offset = torch.clamp(pred_sv_corners_2d - gt_sv_corners_2d_safe, min=-0.5 * img_scale, max=0.5 * img_scale) / img_scale
+                corner_proj_sq = torch.sum(corner_proj_offset ** 2, dim=-1)
+                valid = gt_sv_corner_valid.to(dtype=corner_proj_sq.dtype)
+                loss_obj_corner_proj_stage1 = (corner_proj_sq * valid).sum() / (valid.sum() + 1e-9)
+                loss_obj_corner_proj_stage1 = loss_obj_corner_proj_stage1 * self.obj_corner_proj_weight
+            if self.obj_corner_3d_weight > 0.0:
+                loss_obj_corner_3d_stage1 = self._masked_points_3d_loss(
+                    pred_sv_corners,
+                    gt_sv_corners_3d,
+                    gt_sv_corner_valid,
+                    loss_type=self.joints_loss_type,
+                ) * self.obj_corner_3d_weight
 
         if stage_name == "stage1":
             loss_obj_chamfer_stage1, loss_obj_emd_stage1, loss_obj_sym_corner_stage1 = self._compute_stage1_object_geometry_losses(
@@ -1988,6 +2086,8 @@ class POEM_HeatmapCenterRot(nn.Module, ModuleAbstract):
         loss_dict['loss_obj_chamfer_stage1'] = loss_obj_chamfer_stage1
         loss_dict['loss_obj_emd_stage1'] = loss_obj_emd_stage1
         loss_dict['loss_obj_sym_corner_stage1'] = loss_obj_sym_corner_stage1
+        loss_dict['loss_obj_corner_proj_stage1'] = loss_obj_corner_proj_stage1
+        loss_dict['loss_obj_corner_3d_stage1'] = loss_obj_corner_3d_stage1
 
         # ====================================================================
         # 3. MANO Prior & Consistency Constraints (人体工学与视角一致性)
@@ -2057,12 +2157,15 @@ class POEM_HeatmapCenterRot(nn.Module, ModuleAbstract):
         final_sym_corner = pred_mano_3d_mesh_sv.new_tensor(0.0)
         final_penetration = pred_mano_3d_mesh_sv.new_tensor(0.0)
         final_obj_pose = pred_mano_3d_mesh_sv.new_tensor(0.0)
+        final_corner_proj = pred_mano_3d_mesh_sv.new_tensor(0.0)
+        final_corner_3d = pred_mano_3d_mesh_sv.new_tensor(0.0)
         loss_mano_proj = pred_mano_3d_mesh_sv.new_tensor(0.0)
         loss_mano_proj_kp = pred_mano_3d_mesh_sv.new_tensor(0.0)
         loss_mano_proj_mesh = pred_mano_3d_mesh_sv.new_tensor(0.0)
 
         for i in range(pred_hand_mesh_master.shape[0]):
             pred_hand_mesh_master_i = pred_hand_mesh_master[i]  # (B, 799, 3)
+            zero = pred_hand_mesh_master_i.new_tensor(0.0)
             if not torch.isfinite(pred_hand_mesh_master_i).all():
                 logger.warning(
                     f"[NonFiniteDecoderHandState] stage={stage_name} layer={i} "
@@ -2085,11 +2188,11 @@ class POEM_HeatmapCenterRot(nn.Module, ModuleAbstract):
                     pred_hand_joints_master_i, gt_T_c2m, gt_K, hand_joints_2d_gt, n_views, img_scale, visibility=joints_vis_mv
                 ) * self.decoder_proj_weight
             else:
-                zero = pred_hand_mesh_master_i.new_tensor(0.0)
                 loss_3d_joints = zero
                 loss_2d_joints = zero
 
             if enable_object_refine:
+                pred_obj_corners_i = None
                 pred_obj_rot6d_i = torch.nan_to_num(pred_obj_rot6d_i, nan=0.0, posinf=10.0, neginf=-10.0)
                 pred_obj_trans_i = torch.nan_to_num(pred_obj_trans_i, nan=0.0, posinf=10.0, neginf=-10.0)
                 pred_obj_points_i = torch.nan_to_num(pred_obj_points_i, nan=0.0, posinf=self.data_preset_cfg.BBOX_3D_SIZE * 8.0, neginf=-self.data_preset_cfg.BBOX_3D_SIZE * 8.0)
@@ -2107,12 +2210,45 @@ class POEM_HeatmapCenterRot(nn.Module, ModuleAbstract):
                 loss_chamfer = loss_chamfer_raw * self.obj_chamfer_weight * obj_warmup
                 loss_emd_raw = torch.mean(self.earth_mover_loss(pred_obj_points_i.float(), master_obj_sparse_gt.float(), transpose=False) / pred_obj_points_i.shape[1])
                 loss_emd = loss_emd_raw * self.obj_emd_weight * obj_warmup
+                if master_obj_corner_rest is not None and gt_sv_corners_2d is not None and self.obj_corner_proj_weight > 0.0:
+                    pred_obj_corners_i = self._build_object_points_from_hand_pose_grad(
+                        master_obj_corner_rest,
+                        pred_obj_rot6d_i,
+                        master_hand_joints_gt[:, self.center_idx:self.center_idx + 1],
+                        pred_obj_trans_i,
+                    )
+                    loss_corner_proj = self.loss_proj_to_multicam(
+                        pred_obj_corners_i,
+                        gt_T_c2m,
+                        gt_K,
+                        gt_sv_corners_2d,
+                        n_views,
+                        img_scale,
+                        visibility=gt_sv_corner_valid,
+                    ) * self.obj_corner_proj_weight * obj_warmup
+                else:
+                    loss_corner_proj = zero
+                if master_obj_corner_rest is not None and gt_master_corners_3d is not None and self.obj_corner_3d_weight > 0.0:
+                    if pred_obj_corners_i is None:
+                        pred_obj_corners_i = self._build_object_points_from_hand_pose_grad(
+                            master_obj_corner_rest,
+                            pred_obj_rot6d_i,
+                            master_hand_joints_gt[:, self.center_idx:self.center_idx + 1],
+                            pred_obj_trans_i,
+                        )
+                    loss_corner_3d = self._masked_points_3d_loss(
+                        pred_obj_corners_i,
+                        gt_master_corners_3d,
+                        gt_master_corner_valid,
+                        loss_type=self.joints_loss_type,
+                    ) * self.obj_corner_3d_weight * obj_warmup
+                else:
+                    loss_corner_3d = zero
 
                 obj_to_hand_dist = torch.cdist(pred_obj_points_i.float(), pred_hand_mesh_master_i.float())  # [B, 2048, 778]
                 min_dist, _ = obj_to_hand_dist.min(dim=-1)
                 loss_penetration = torch.mean(F.relu(0.002 - min_dist)) * self.obj_penetration_weight * obj_warmup
             else:
-                zero = pred_hand_mesh_master_i.new_tensor(0.0)
                 loss_obj_rot_geo = zero
                 loss_obj_rot_l1 = zero
                 loss_obj_rot = zero
@@ -2121,10 +2257,21 @@ class POEM_HeatmapCenterRot(nn.Module, ModuleAbstract):
                 loss_obj_pose = zero
                 loss_chamfer = zero
                 loss_emd = zero
+                loss_corner_proj = zero
+                loss_corner_3d = zero
                 loss_penetration = zero
 
             # Accumulate layer-wise reconstruction loss
-            layer_recon_loss = loss_3d_joints + loss_2d_joints + loss_obj_pose + loss_chamfer + loss_emd + loss_penetration
+            layer_recon_loss = (
+                loss_3d_joints
+                + loss_2d_joints
+                + loss_obj_pose
+                + loss_chamfer
+                + loss_emd
+                + loss_corner_proj
+                + loss_corner_3d
+                + loss_penetration
+            )
             loss_recon_total += layer_recon_loss
             loss_dict[f'dec{i}_recon'] = layer_recon_loss
 
@@ -2147,18 +2294,24 @@ class POEM_HeatmapCenterRot(nn.Module, ModuleAbstract):
                 loss_dict['loss_2d_proj'] = loss_2d_joints
                 final_chamfer = loss_chamfer
                 final_emd = loss_emd
+                final_corner_proj = loss_corner_proj
+                final_corner_3d = loss_corner_3d
                 final_penetration = loss_penetration
                 loss_dict['loss_obj_rot'] = loss_obj_rot
                 loss_dict['loss_obj_rot_geo'] = loss_obj_rot_geo
                 loss_dict['loss_obj_rot_l1_aux'] = loss_obj_rot_l1
                 loss_dict['loss_obj_trans'] = loss_obj_trans
                 loss_dict['loss_obj_points'] = loss_obj_points
+                loss_dict['loss_obj_corner_proj'] = loss_corner_proj
+                loss_dict['loss_obj_corner_3d'] = loss_corner_3d
                 final_obj_pose = loss_obj_pose
 
         loss_dict.update({
             'loss_obj_pose': final_obj_pose,
             'loss_obj_chamfer': loss_obj_chamfer_stage1 + final_chamfer,
             'loss_obj_emd': loss_obj_emd_stage1 + final_emd,
+            'loss_obj_corner_proj_total': loss_obj_corner_proj_stage1 + final_corner_proj,
+            'loss_obj_corner_3d_total': loss_obj_corner_3d_stage1 + final_corner_3d,
             'loss_obj_sym_corner': loss_obj_sym_corner_stage1 + final_sym_corner,
             'loss_penetration': final_penetration,
             'loss_obj_warmup': pred_mano_3d_mesh_sv.new_tensor(float(obj_warmup)),
@@ -2173,6 +2326,8 @@ class POEM_HeatmapCenterRot(nn.Module, ModuleAbstract):
             + loss_heatmap_obj_map
             + loss_obj_chamfer_stage1
             + loss_obj_emd_stage1
+            + loss_obj_corner_proj_stage1
+            + loss_obj_corner_3d_stage1
             + loss_obj_sym_corner_stage1
             + loss_mano_consistency
             + loss_pose_reg

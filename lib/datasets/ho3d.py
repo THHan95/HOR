@@ -13,8 +13,11 @@ import imageio
 import numpy as np
 import torch
 import torch.nn as nn
+import trimesh
 import yaml
 from manotorch.manolayer import ManoLayer, MANOOutput
+from pytorch3d.ops import sample_points_from_meshes
+from pytorch3d.structures import Meshes
 from termcolor import colored
 
 from ..utils.builder import DATASET
@@ -22,8 +25,46 @@ from ..utils.config import CN
 from ..utils.etqdm import etqdm
 from ..utils.logger import logger
 from ..utils.transform import (SE3_transform, aa_to_rotmat, batch_ref_bone_len, cal_transform_mean, denormalize,
-                               get_annot_center, get_annot_scale, persp_project, rotmat_to_aa)
+                               get_annot_center, get_annot_scale, persp_project, rotmat_to_aa, rotmat_to_rot6d)
 from .hdata import HDataset, kpId2vertices
+
+
+def _bbox21_from_bounds(bounds):
+    bounds = np.asarray(bounds, dtype=np.float32)
+    x_min, y_min, z_min = bounds[0]
+    x_max, y_max, z_max = bounds[1]
+    p_blb = np.array([x_min, y_min, z_min], dtype=np.float32)
+    p_brb = np.array([x_max, y_min, z_min], dtype=np.float32)
+    p_blf = np.array([x_min, y_max, z_min], dtype=np.float32)
+    p_brf = np.array([x_max, y_max, z_min], dtype=np.float32)
+    p_tlb = np.array([x_min, y_min, z_max], dtype=np.float32)
+    p_trb = np.array([x_max, y_min, z_max], dtype=np.float32)
+    p_tlf = np.array([x_min, y_max, z_max], dtype=np.float32)
+    p_trf = np.array([x_max, y_max, z_max], dtype=np.float32)
+    p_center = (p_tlb + p_brf) * 0.5
+    p_ble = (p_blb + p_blf) * 0.5
+    p_bre = (p_brb + p_brf) * 0.5
+    p_bfe = (p_blf + p_brf) * 0.5
+    p_bbe = (p_blb + p_brb) * 0.5
+    p_tle = (p_tlb + p_tlf) * 0.5
+    p_tre = (p_trb + p_trf) * 0.5
+    p_tfe = (p_tlf + p_trf) * 0.5
+    p_tbe = (p_tlb + p_trb) * 0.5
+    p_lfe = (p_tlf + p_blf) * 0.5
+    p_lbe = (p_tlb + p_blb) * 0.5
+    p_rfe = (p_trf + p_brf) * 0.5
+    p_rbe = (p_trb + p_brb) * 0.5
+    return np.stack(
+        (
+            p_blb, p_brb, p_blf, p_brf,
+            p_tlb, p_trb, p_tlf, p_trf,
+            p_ble, p_bre, p_bfe, p_bbe,
+            p_tle, p_tre, p_tfe, p_tbe,
+            p_lfe, p_lbe, p_rfe, p_rbe,
+            p_center,
+        ),
+        axis=0,
+    ).astype(np.float32)
 
 
 @DATASET.register_module()
@@ -63,6 +104,7 @@ class HO3D(HDataset):
 
         # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
         self.load_dataset()
+        self._init_object_assets()
 
     def _preload(self):
         # deal with all the naming and path convention
@@ -117,6 +159,85 @@ class HO3D(HDataset):
 
         logger.info(f"{self.name} Got {colored(len(self.sample_idxs), 'yellow', attrs=['bold'])}"
                     f"/{len(self.seq_idx)} samples for data_split {self.data_split}")
+
+    def _resolve_ycb_model_root(self):
+        candidates = [
+            os.path.join(self.data_root, "DexYCB", "models"),
+            os.path.join(self.data_root, "YCB", "models"),
+            os.path.join("data", "DexYCB", "models"),
+        ]
+        for candidate in candidates:
+            if os.path.isdir(candidate):
+                return candidate
+        raise FileNotFoundError(
+            "Could not find YCB object models for HO3D object supervision. "
+            "Expected a directory like DATA_ROOT/DexYCB/models."
+        )
+
+    @staticmethod
+    def _pick_mesh_path(model_root, obj_name, obj_id):
+        candidates = [
+            os.path.join(model_root, obj_name, "textured_simple.obj"),
+            os.path.join(model_root, obj_name, "textured.obj"),
+            os.path.join(os.path.dirname(model_root), "bop", "models_eval", f"obj_{obj_id:06d}.ply"),
+        ]
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        raise FileNotFoundError(f"Could not find a mesh for HO3D object {obj_name} (id={obj_id})")
+
+    def _iter_unique_objects(self):
+        unique = {}
+        for seq_annots in self.annot_mapping.values():
+            for annot in seq_annots:
+                obj_name = annot.get("objName", None)
+                obj_label = annot.get("objLabel", None)
+                if obj_name is None or obj_label is None:
+                    continue
+                unique[str(obj_name)] = int(obj_label)
+        return sorted(unique.items(), key=lambda kv: kv[1])
+
+    def _init_object_assets(self):
+        self.obj_rest_corners = {}
+        self.obj_kp21_rest = {}
+        self.obj_pc_sparse = {}
+        self.obj_pc_dense = {}
+        self.obj_pc_eval = {}
+        self.obj_name_to_id = {}
+        self.obj_id_to_name = {}
+        self.obj_mesh_path = {}
+        self.ycb_model_root = self._resolve_ycb_model_root()
+
+        unique_objects = self._iter_unique_objects()
+        if not self.quiet_init:
+            logger.info(
+                f"Pre-sampling HO3D YCB objects from {self.ycb_model_root} "
+                f"(Sparse: 2048, Dense: 16384, Eval: 30000)..."
+            )
+
+        for obj_name, obj_id in unique_objects:
+            mesh_path = self._pick_mesh_path(self.ycb_model_root, obj_name, obj_id)
+            object_mesh = trimesh.load(mesh_path, process=False)
+
+            verts = torch.from_numpy(np.asarray(object_mesh.vertices, dtype=np.float32)).float()
+            faces = torch.from_numpy(np.asarray(object_mesh.faces, dtype=np.int64)).long()
+            pt3d_mesh = Meshes(verts=[verts], faces=[faces])
+
+            pc_sparse = sample_points_from_meshes(pt3d_mesh, 2048)[0].numpy()
+            pc_dense = sample_points_from_meshes(pt3d_mesh, 16384)[0].numpy()
+            pc_eval = sample_points_from_meshes(pt3d_mesh, 30000)[0].numpy()
+
+            self.obj_name_to_id[obj_name] = obj_id
+            self.obj_id_to_name[obj_id] = obj_name
+            self.obj_mesh_path[obj_id] = mesh_path
+            self.obj_rest_corners[obj_id] = trimesh.bounds.corners(object_mesh.bounds).astype(np.float32)
+            self.obj_kp21_rest[obj_id] = _bbox21_from_bounds(object_mesh.bounds)
+            self.obj_pc_sparse[obj_id] = pc_sparse.astype(np.float32)
+            self.obj_pc_dense[obj_id] = pc_dense.astype(np.float32)
+            self.obj_pc_eval[obj_id] = pc_eval.astype(np.float32)
+
+        if not self.quiet_init:
+            logger.info(f"HO3D object assets ready for {len(unique_objects)} YCB objects")
 
     def _load_seq_frames(self, subfolder=None, seqs=None, trainval_idx=6000):
         """
@@ -202,6 +323,30 @@ class HO3D(HDataset):
         zeroo = np.zeros((640, 480))
         return np.array(zeroo, dtype=np.uint8)
 
+    def get_obj_corners(self, idx):
+        seq, img_idx = self.seq_idx[idx]
+        annot = self.annot_mapping[seq][img_idx]
+        obj_corners = np.asarray(annot["objCorners3D"], dtype=np.float32)
+        obj_corners = self.cam_extr[:3, :3].dot(obj_corners.transpose()).transpose()
+        return obj_corners.astype(np.float32)
+
+    def get_bbox_hand_obj(self, idx, scale_factor=1.25):
+        hand_joints_2d = self.get_joints_2d(idx)
+        obj_corners = self.get_obj_corners(idx)
+        cam_intr = self.get_cam_intr(idx)
+        obj_corners_2d = persp_project(obj_corners, cam_intr)
+        tl = np.min(np.concatenate([hand_joints_2d, obj_corners_2d], axis=0), axis=0)
+        br = np.max(np.concatenate([hand_joints_2d, obj_corners_2d], axis=0), axis=0)
+
+        c_x = int((br[0] + tl[0]) / 2)
+        c_y = int((br[1] + tl[1]) / 2)
+        center = np.asarray([c_x, c_y], dtype=np.float32)
+
+        delta_x = br[0] - tl[0]
+        delta_y = br[1] - tl[1]
+        scale = max(delta_x, delta_y) * scale_factor
+        return center, float(scale)
+
     def get_joints_2d(self, idx):
         joints_3d = self.get_joints_3d(idx)
         cam_intr = self.get_cam_intr(idx)
@@ -242,6 +387,67 @@ class HO3D(HDataset):
         seq, img_idx = self.seq_idx[idx]
         cam_intr = self.annot_mapping[seq][img_idx]["camMat"]
         return cam_intr.astype(np.float32)
+
+    def _get_obj_pose_cam(self, idx):
+        seq, img_idx = self.seq_idx[idx]
+        annot = self.annot_mapping[seq][img_idx]
+        obj_rot_aa = np.asarray(annot["objRot"], dtype=np.float32).reshape(1, 3)
+        obj_trans = np.asarray(annot["objTrans"], dtype=np.float32).reshape(3, 1)
+        rot_raw = np.asarray(aa_to_rotmat(obj_rot_aa), dtype=np.float32).reshape(3, 3)
+        rot_cam = self.cam_extr[:3, :3] @ rot_raw
+        trans_cam = self.cam_extr[:3, :3] @ obj_trans
+        return rot_cam.astype(np.float32), trans_cam.astype(np.float32)
+
+    def get_obj_pose_and_points(self, idx):
+        seq, img_idx = self.seq_idx[idx]
+        annot = self.annot_mapping[seq][img_idx]
+        obj_name = str(annot["objName"])
+        obj_id = int(annot["objLabel"])
+
+        if obj_id not in self.obj_pc_sparse:
+            obj_id = self.obj_name_to_id[obj_name]
+
+        rot_cam, trans_cam = self._get_obj_pose_cam(idx)
+        hand_joints_3d = self.get_joints_3d(idx)
+        hand_root_cam = hand_joints_3d[self.center_idx].reshape(3, 1)
+        t_label_rel = (trans_cam - hand_root_cam).astype(np.float32)
+        rot6d_label = rotmat_to_rot6d(torch.from_numpy(rot_cam).unsqueeze(0)).squeeze(0).numpy().astype(np.float32)
+
+        pc_sparse_rest = self.obj_pc_sparse[obj_id]
+        pc_dense_rest = self.obj_pc_dense[obj_id]
+        pc_eval_rest = self.obj_pc_eval[obj_id]
+        kp21_rest = self.obj_kp21_rest[obj_id]
+
+        pc_sparse_cam = (rot_cam @ pc_sparse_rest.T).T + trans_cam.flatten()
+        pc_dense_cam = (rot_cam @ pc_dense_rest.T).T + trans_cam.flatten()
+        kp21_cam = (rot_cam @ kp21_rest.T).T + trans_cam.flatten()
+
+        return {
+            "obj_id": obj_id,
+            "R_label": rot_cam,
+            "t_label_rel": t_label_rel.flatten(),
+            "rot6d_label": rot6d_label,
+            "sparse_rest": pc_sparse_rest,
+            "eval_rest": pc_eval_rest,
+            "kp21_rest": kp21_rest,
+            "kp21_cam": kp21_cam.astype(np.float32),
+            "sparse_cam": pc_sparse_cam.astype(np.float32),
+            "dense_cam": pc_dense_cam.astype(np.float32),
+        }
+
+    def get_obj_info(self, idx):
+        seq, img_idx = self.seq_idx[idx]
+        annot = self.annot_mapping[seq][img_idx]
+        obj_name = str(annot["objName"])
+        obj_id = int(annot["objLabel"])
+        if obj_id not in self.obj_pc_sparse:
+            obj_id = self.obj_name_to_id[obj_name]
+
+        rot_cam, trans_cam = self._get_obj_pose_cam(idx)
+        obj_transform = np.eye(4, dtype=np.float32)
+        obj_transform[:3, :3] = rot_cam
+        obj_transform[:3, 3] = trans_cam.flatten()
+        return obj_id, obj_transform
 
     def get_cam_center(self, idx):
         intr = self.get_cam_intr(idx)
@@ -862,6 +1068,13 @@ class HO3Dv3MultiView(torch.utils.data.Dataset):
             T_master_2_new_master = sample["target_cam_extr"][new_master_id]
             master_joints_3d = sample["target_joints_3d_no_rot"][new_master_id]
             master_verts_3d = sample["target_verts_3d_no_rot"][new_master_id]
+            master_obj_kp21 = sample["target_obj_kp21_no_rot"][new_master_id]
+            master_obj_kp21_rest = sample["target_obj_kp21_rest"][new_master_id]
+            master_obj_sparse = sample["target_obj_sparse_no_rot"][new_master_id]
+            master_obj_sparse_rest = sample["target_obj_pc_sparse_rest"][new_master_id]
+            master_obj_eval_rest = sample["target_obj_pc_eval_rest"][new_master_id]
+            master_obj_rot6d_label = sample["target_rot6d_label"][new_master_id]
+            master_obj_t_label_rel = sample["target_t_label_rel"][new_master_id]
 
         elif self.master_system == "as_constant_camera":
             new_master_serial = sample["cam_serial"][0][:-1] + f"{self.const_cam_id}"
@@ -869,6 +1082,13 @@ class HO3Dv3MultiView(torch.utils.data.Dataset):
             T_master_2_new_master = sample["target_cam_extr"][new_master_id]
             master_joints_3d = sample["target_joints_3d_no_rot"][new_master_id]
             master_verts_3d = sample["target_verts_3d_no_rot"][new_master_id]
+            master_obj_kp21 = sample["target_obj_kp21_no_rot"][new_master_id]
+            master_obj_kp21_rest = sample["target_obj_kp21_rest"][new_master_id]
+            master_obj_sparse = sample["target_obj_sparse_no_rot"][new_master_id]
+            master_obj_sparse_rest = sample["target_obj_pc_sparse_rest"][new_master_id]
+            master_obj_eval_rest = sample["target_obj_pc_eval_rest"][new_master_id]
+            master_obj_rot6d_label = sample["target_rot6d_label"][new_master_id]
+            master_obj_t_label_rel = sample["target_t_label_rel"][new_master_id]
 
         for i, T_m2c in enumerate(sample["target_cam_extr"]):
             T_new_master_2_cam = np.linalg.inv(T_master_2_new_master) @ T_m2c
@@ -887,6 +1107,19 @@ class HO3Dv3MultiView(torch.utils.data.Dataset):
         sample["master_serial"] = new_master_serial
         sample["master_joints_3d"] = master_joints_3d
         sample["master_verts_3d"] = master_verts_3d
+        sample["master_obj_kp21"] = master_obj_kp21
+        sample["master_obj_kp21_rest"] = master_obj_kp21_rest
+        sample["master_obj_sparse"] = master_obj_sparse
+        sample["master_obj_sparse_rest"] = master_obj_sparse_rest
+        sample["master_obj_eval_rest"] = master_obj_eval_rest
+        sample["master_obj_rot6d_label"] = master_obj_rot6d_label
+        sample["master_obj_t_label_rel"] = master_obj_t_label_rel
+        if "target_obj_pc_eval_rest" in sample:
+            del sample["target_obj_pc_eval_rest"]
+
+        for query, value in sample.items():
+            if isinstance(value, np.ndarray):
+                sample[query] = np.ascontiguousarray(value)
 
         return sample
 
