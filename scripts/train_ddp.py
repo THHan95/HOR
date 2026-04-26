@@ -339,7 +339,14 @@ def main_worker(gpu_id: int, cfg: CN, arg: Namespace, time_f: float):
                 if log_step_boundary:
                     logger.warning(f"[BatchTrace] rank={rank} epoch={epoch_idx} stage={stage_name} bidx={bidx} forward_start")
                     _log_cuda_memory(f"epoch={epoch_idx} stage={stage_name} bidx={bidx} pre_forward", rank)
-                preds, loss_dict = model(batch, step_idx, "train", epoch_idx=epoch_idx)
+                preds, loss_dict = model(
+                    batch,
+                    step_idx,
+                    "train",
+                    epoch_idx=epoch_idx,
+                    epoch_batch_idx=bidx,
+                    epoch_num_batches=len(train_loader),
+                )
                 loss = loss_dict["loss"]
                 local_loss_finite = bool(torch.isfinite(loss).all().item())
                 global_loss_finite = _distributed_loss_is_finite(loss, arg, rank)
@@ -439,7 +446,14 @@ def main_worker(gpu_id: int, cfg: CN, arg: Namespace, time_f: float):
                     for bidx, batch in enumerate(valbar):
                         step_idx = epoch_idx * len(val_loader) + bidx
                         batch = _move_to_device(batch, rank)
-                        _ = base_model(batch, step_idx, "val", epoch_idx=epoch_idx)
+                        _ = base_model(
+                            batch,
+                            step_idx,
+                            "val",
+                            epoch_idx=epoch_idx,
+                            epoch_batch_idx=bidx,
+                            epoch_num_batches=len(val_loader),
+                        )
 
                         valbar.set_description(f"{bar_perfixes['val']} Epoch {epoch_idx} "
                                                f"{base_model.format_metric('val')}")

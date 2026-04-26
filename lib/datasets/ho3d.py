@@ -76,6 +76,7 @@ class HO3D(HDataset):
         self.mini_factor_of_dataset = float(cfg.get("MINI_FACTOR", 1.0))
 
         self.use_gt_from_multiview = cfg.get("USE_GT_FROM_MULTIVIEW", False)
+        self.use_official_eval_gt_json = bool(cfg.get("USE_OFFICIAL_EVAL_GT_JSON", False))
         self.use_test_gt_root = os.path.join(self.data_root, "HO3D_v3_manual_test_gt")
 
         # ======== HO3D params >>>>>>>>>>>>>>>>>>
@@ -152,6 +153,7 @@ class HO3D(HDataset):
         self.seq_idx = annotations["seq_idx"]
         self.annot_mapping = annotations["annot_mapping"]
         self.sample_idxs = list(range(len(self.seq_idx)))
+        self._load_official_eval_gt()
 
         if self.mini_factor_of_dataset != float(1):
             random.Random(1).shuffle(self.sample_idxs)
@@ -159,6 +161,96 @@ class HO3D(HDataset):
 
         logger.info(f"{self.name} Got {colored(len(self.sample_idxs), 'yellow', attrs=['bold'])}"
                     f"/{len(self.seq_idx)} samples for data_split {self.data_split}")
+
+    def _load_official_eval_gt(self):
+        self.official_eval_xyz = None
+        self.official_eval_verts = None
+        self.official_eval_key_to_idx = {}
+        self._test_hand_gt_cache = {}
+
+        if not (self.data_split == "test" and self.use_official_eval_gt_json):
+            return
+
+        eval_txt_path = os.path.join(self.root, "evaluation.txt")
+        xyz_path = os.path.join(self.root, "evaluation_xyz.json")
+        verts_path = os.path.join(self.root, "evaluation_verts.json")
+        cache_path = os.path.join("common", "cache", self.name, "official_eval_hand_gt_v1.npz")
+
+        if not (os.path.isfile(eval_txt_path) and os.path.isfile(xyz_path) and os.path.isfile(verts_path)):
+            logger.warning(
+                f"{self.name} official evaluation GT JSON files are missing; "
+                f"expected {xyz_path} and {verts_path}"
+            )
+            return
+
+        with open(eval_txt_path, "r") as f:
+            frame_keys = [line.strip() for line in f if line.strip()]
+
+        xyz, verts = None, None
+        if os.path.isfile(cache_path):
+            try:
+                cache = np.load(cache_path, allow_pickle=False)
+                cached_keys = cache["frame_keys"].astype(str).tolist()
+                if cached_keys == frame_keys:
+                    xyz = cache["xyz"].astype(np.float32)
+                    verts = cache["verts"].astype(np.float32)
+                    logger.info(f"Loaded official HO3D eval GT cache from {cache_path}")
+            except Exception as exc:
+                logger.warning(f"Failed to load official HO3D eval GT cache {cache_path}: {exc}")
+
+        if xyz is None or verts is None:
+            logger.info("Loading official HO3D eval joints/verts GT from JSON files...")
+            with open(xyz_path, "r") as f:
+                xyz = np.asarray(json.load(f), dtype=np.float32)
+            with open(verts_path, "r") as f:
+                verts = np.asarray(json.load(f), dtype=np.float32)
+
+            if len(xyz) != len(frame_keys) or len(verts) != len(frame_keys):
+                raise ValueError(
+                    f"Official HO3D eval GT length mismatch: "
+                    f"len(xyz)={len(xyz)}, len(verts)={len(verts)}, len(keys)={len(frame_keys)}"
+                )
+
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            np.savez(cache_path, xyz=xyz, verts=verts, frame_keys=np.asarray(frame_keys))
+            logger.info(f"Cached official HO3D eval GT to {cache_path}")
+
+        self.official_eval_xyz = xyz
+        self.official_eval_verts = verts
+        self.official_eval_key_to_idx = {key: idx for idx, key in enumerate(frame_keys)}
+
+    def _get_test_gt_entry(self, seq, img_idx):
+        cache_key = (seq, int(img_idx))
+        if cache_key in self._test_hand_gt_cache:
+            return self._test_hand_gt_cache[cache_key]
+
+        annot = self.annot_mapping[seq][img_idx]
+        frame_idx = str(annot["frame_idx"])
+        entry = None
+
+        if self.use_gt_from_multiview:
+            test_gt_root = os.path.join(self.use_test_gt_root, seq, "meta", f"{frame_idx}.pkl")
+            if os.path.exists(test_gt_root):
+                with open(test_gt_root, "rb") as p_f:
+                    manual_gt = pickle.load(p_f)
+                entry = {
+                    "source": "manual_test_gt",
+                    "target_joints_3d": manual_gt["target_joints_3d"].astype(np.float32),
+                    "target_verts_3d": manual_gt["target_verts_3d"].astype(np.float32),
+                    "mano_pose": manual_gt["mano_pose"].astype(np.float32),
+                    "mano_shape": manual_gt["mano_shape"].astype(np.float32),
+                }
+
+        if entry is None and self.official_eval_xyz is not None and self.official_eval_verts is not None:
+            official_idx = self.official_eval_key_to_idx.get(f"{seq}/{frame_idx}", None)
+            if official_idx is not None:
+                entry = {
+                    "source": "official_eval_json",
+                    "official_idx": int(official_idx),
+                }
+
+        self._test_hand_gt_cache[cache_key] = entry
+        return entry
 
     def _resolve_ycb_model_root(self):
         candidates = [
@@ -335,17 +427,14 @@ class HO3D(HDataset):
         obj_corners = self.get_obj_corners(idx)
         cam_intr = self.get_cam_intr(idx)
         obj_corners_2d = persp_project(obj_corners, cam_intr)
-        tl = np.min(np.concatenate([hand_joints_2d, obj_corners_2d], axis=0), axis=0)
-        br = np.max(np.concatenate([hand_joints_2d, obj_corners_2d], axis=0), axis=0)
+        if self.crop_model == "root_obj":
+            crop_points_2d = np.concatenate([hand_joints_2d[[self.center_idx]], obj_corners_2d], axis=0)
+        else:
+            crop_points_2d = np.concatenate([hand_joints_2d, obj_corners_2d], axis=0)
 
-        c_x = int((br[0] + tl[0]) / 2)
-        c_y = int((br[1] + tl[1]) / 2)
-        center = np.asarray([c_x, c_y], dtype=np.float32)
-
-        delta_x = br[0] - tl[0]
-        delta_y = br[1] - tl[1]
-        scale = max(delta_x, delta_y) * scale_factor
-        return center, float(scale)
+        center = get_annot_center(crop_points_2d)
+        scale = get_annot_scale(crop_points_2d) * scale_factor
+        return center.astype(np.float32), float(scale)
 
     def get_joints_2d(self, idx):
         joints_3d = self.get_joints_3d(idx)
@@ -354,28 +443,30 @@ class HO3D(HDataset):
 
     def get_joints_3d(self, idx):
         seq, img_idx = self.seq_idx[idx]
-        if self.data_split == "train" or (self.data_split == "test" and self.use_gt_from_multiview == False):
+        if self.data_split == "train":
             annot = self.annot_mapping[seq][img_idx]
             joints_3d = annot["handJoints3D"]
             joints_3d = self.cam_extr[:3, :3].dot(joints_3d.transpose()).transpose()
             joints_3d = joints_3d[self.reorder_idxs]
             return joints_3d.astype(np.float32)
-        elif self.data_split == "test" and self.use_gt_from_multiview:
-            img_id = str(img_idx)
-            if len(img_id) < 4:
-                img_id = str(img_idx + 10000)[-4:]
-            test_gt_root = os.path.join(self.use_test_gt_root, seq, "meta", f"{img_id}.pkl")
-            if os.path.exists(test_gt_root):
-                with open(test_gt_root, "rb") as p_f:
-                    annot = pickle.load(p_f)
-                joints_3d = annot["target_joints_3d"]
-                return joints_3d.astype(np.float32)
-            else:
-                annot = self.annot_mapping[seq][img_idx]
-                joints_3d = annot["handJoints3D"]
+
+        if self.data_split == "test":
+            test_gt = self._get_test_gt_entry(seq, img_idx)
+            if test_gt is not None:
+                if test_gt["source"] == "manual_test_gt":
+                    return test_gt["target_joints_3d"].astype(np.float32)
+                joints_3d = self.official_eval_xyz[test_gt["official_idx"]]
                 joints_3d = self.cam_extr[:3, :3].dot(joints_3d.transpose()).transpose()
                 joints_3d = joints_3d[self.reorder_idxs]
                 return joints_3d.astype(np.float32)
+
+            annot = self.annot_mapping[seq][img_idx]
+            joints_3d = annot["handJoints3D"]
+            joints_3d = self.cam_extr[:3, :3].dot(joints_3d.transpose()).transpose()
+            joints_3d = joints_3d[self.reorder_idxs]
+            return joints_3d.astype(np.float32)
+
+        raise RuntimeError(f"Unsupported data split for HO3D joints: {self.data_split}")
 
     def get_joints_uvd(self, idx):
         uv = self.get_joints_2d(idx)
@@ -455,53 +546,51 @@ class HO3D(HDataset):
 
     def get_mano_pose(self, idx):
         seq, img_idx = self.seq_idx[idx]
-        if self.data_split == "train" or (self.data_split == "test" and self.use_gt_from_multiview == False):
+        if self.data_split == "train":
             annot = self.annot_mapping[seq][img_idx]
             handpose = annot["handPose"]
             root, remains = handpose[:3], handpose[3:]
             root = rotmat_to_aa(self.cam_extr[:3, :3] @ aa_to_rotmat(root))
             handpose_transformed = np.concatenate((root, remains), axis=0)
             return handpose_transformed.astype(np.float32)
-        elif self.data_split == "test" and self.use_gt_from_multiview:
-            img_id = str(img_idx)
-            if len(img_id) < 4:
-                img_id = str(img_idx + 10000)[-4:]
-            test_gt_root = os.path.join(self.use_test_gt_root, seq, "meta", f"{img_id}.pkl")
-            if os.path.exists(test_gt_root):
-                with open(test_gt_root, "rb") as p_f:
-                    annot = pickle.load(p_f)
-                handpose = annot["mano_pose"]
-                return handpose.astype(np.float32)
-            else:
-                annot = self.annot_mapping[seq][img_idx]
-                handpose = annot["handPose"]
-                root, remains = handpose[:3], handpose[3:]
-                root = rotmat_to_aa(self.cam_extr[:3, :3] @ aa_to_rotmat(root))
-                handpose_transformed = np.concatenate((root, remains), axis=0)
-                return handpose_transformed.astype(np.float32)
+
+        if self.data_split == "test":
+            test_gt = self._get_test_gt_entry(seq, img_idx)
+            if test_gt is not None:
+                if test_gt["source"] == "manual_test_gt":
+                    return test_gt["mano_pose"].astype(np.float32)
+                return np.zeros(48, dtype=np.float32)
+
+            annot = self.annot_mapping[seq][img_idx]
+            handpose = annot["handPose"]
+            root, remains = handpose[:3], handpose[3:]
+            root = rotmat_to_aa(self.cam_extr[:3, :3] @ aa_to_rotmat(root))
+            handpose_transformed = np.concatenate((root, remains), axis=0)
+            return handpose_transformed.astype(np.float32)
+
+        raise RuntimeError(f"Unsupported data split for HO3D MANO pose: {self.data_split}")
 
     def get_mano_shape(self, idx):
         seq, img_idx = self.seq_idx[idx]
-        if self.data_split == "train" or (self.data_split == "test" and self.use_gt_from_multiview == False):
+        if self.data_split == "train":
             annot = self.annot_mapping[seq][img_idx]
             shape = annot["handBeta"]
             shape = np.array(shape, dtype=np.float32)
             return shape
-        elif self.data_split == "test" and self.use_gt_from_multiview:
-            img_id = str(img_idx)
-            if len(img_id) < 4:
-                img_id = str(img_idx + 10000)[-4:]
-            test_gt_root = os.path.join(self.use_test_gt_root, seq, "meta", f"{img_id}.pkl")
-            if os.path.exists(test_gt_root):
-                with open(test_gt_root, "rb") as p_f:
-                    annot = pickle.load(p_f)
-                shape = annot["mano_shape"]
-                return shape.astype(np.float32)
-            else:
-                annot = self.annot_mapping[seq][img_idx]
-                shape = annot["handBeta"]
-                shape = np.array(shape, dtype=np.float32)
-                return shape
+
+        if self.data_split == "test":
+            test_gt = self._get_test_gt_entry(seq, img_idx)
+            if test_gt is not None:
+                if test_gt["source"] == "manual_test_gt":
+                    return test_gt["mano_shape"].astype(np.float32)
+                return np.zeros(10, dtype=np.float32)
+
+            annot = self.annot_mapping[seq][img_idx]
+            shape = annot["handBeta"]
+            shape = np.array(shape, dtype=np.float32)
+            return shape
+
+        raise RuntimeError(f"Unsupported data split for HO3D MANO shape: {self.data_split}")
 
     def get_verts_uvd(self, idx):
         v3d = self.get_verts_3d(idx)
@@ -517,7 +606,7 @@ class HO3D(HDataset):
         return bone_len.astype(np.float32)
 
     def get_verts_3d(self, idx):
-        if self.data_split == "train" or (self.data_split == "test" and self.use_gt_from_multiview == False):
+        if self.data_split == "train":
             _handpose, _handtsl, _handshape = self._ho3d_get_hand_info(idx)
             mano_out = self.mano_layer(
                 torch.from_numpy(_handpose).unsqueeze(0),
@@ -527,27 +616,27 @@ class HO3D(HDataset):
             handverts = mano_out.verts[0].numpy() + _handtsl
             transf_handverts = self.cam_extr[:3, :3].dot(handverts.transpose()).transpose()
             return transf_handverts.astype(np.float32)
-        elif self.data_split == "test" and self.use_gt_from_multiview:
+
+        if self.data_split == "test":
             seq, img_idx = self.seq_idx[idx]
-            img_id = str(img_idx)
-            if len(img_id) < 4:
-                img_id = str(img_idx + 10000)[-4:]
-            test_gt_root = os.path.join(self.use_test_gt_root, seq, "meta", f"{img_id}.pkl")
-            if os.path.exists(test_gt_root):
-                with open(test_gt_root, "rb") as p_f:
-                    annot = pickle.load(p_f)
-                handverts = annot["target_verts_3d"]
+            test_gt = self._get_test_gt_entry(seq, img_idx)
+            if test_gt is not None:
+                if test_gt["source"] == "manual_test_gt":
+                    return test_gt["target_verts_3d"].astype(np.float32)
+                handverts = self.official_eval_verts[test_gt["official_idx"]]
+                handverts = self.cam_extr[:3, :3].dot(handverts.transpose()).transpose()
                 return handverts.astype(np.float32)
-            else:
-                _handpose, _handtsl, _handshape = self._ho3d_get_hand_info(idx)
-                mano_out = self.mano_layer(
-                    torch.from_numpy(_handpose).unsqueeze(0),
-                    torch.from_numpy(_handshape).unsqueeze(0),
-                )
-                # important modify!!!!
-                handverts = mano_out.verts[0].numpy() + _handtsl
-                transf_handverts = self.cam_extr[:3, :3].dot(handverts.transpose()).transpose()
-                return transf_handverts.astype(np.float32)
+
+            _handpose, _handtsl, _handshape = self._ho3d_get_hand_info(idx)
+            mano_out = self.mano_layer(
+                torch.from_numpy(_handpose).unsqueeze(0),
+                torch.from_numpy(_handshape).unsqueeze(0),
+            )
+            handverts = mano_out.verts[0].numpy() + _handtsl
+            transf_handverts = self.cam_extr[:3, :3].dot(handverts.transpose()).transpose()
+            return transf_handverts.astype(np.float32)
+
+        raise RuntimeError(f"Unsupported data split for HO3D verts: {self.data_split}")
 
     def get_verts_2d(self, idx):
         verts_3d = self.get_verts_3d(idx)
@@ -567,6 +656,11 @@ class HO3D(HDataset):
             return center, scale
         elif self.data_split == "test":  # No gt joints annot, using handBoundingBox
             seq, img_idx = self.seq_idx[idx]
+            if self._get_test_gt_entry(seq, img_idx) is not None:
+                joints2d = self.get_joints_2d(idx)
+                center = get_annot_center(joints2d)
+                scale = get_annot_scale(joints2d)
+                return center, scale
             annot = self.annot_mapping[seq][img_idx]
             hand_bbox_coord = annot["handBoundingBox"]  # (x0, y0, x1, y1)
             hand_bbox_2d = np.array(
@@ -707,6 +801,7 @@ class HO3Dv3MultiView(torch.utils.data.Dataset):
         self.cfg = cfg
         self.n_views = cfg.N_VIEWS
         self.data_split = cfg.DATA_SPLIT
+        self.mv_split_mode = str(cfg.get("MV_SPLIT_MODE", "legacy")).lower()
         self.add_evalset_train = cfg.get("ADD_EVALSET_TRAIN", True)
         assert self.data_split in ["train", "val", "test"], f"{self.name} unsupport data split {self.data_split}"
 
@@ -722,52 +817,7 @@ class HO3Dv3MultiView(torch.utils.data.Dataset):
 
         self.set_mappings = {f"{cfg.SPLIT_MODE}_train": _trainset, f"{cfg.SPLIT_MODE}_test": _testset}
         self.root = _trainset.root
-        if self.data_split == "train":
-            self.seq_multiview_dict = {
-                "ABF10": 0,
-                "ABF11": 1,
-                "ABF12": 2,
-                "ABF13": 3,
-                "ABF14": 4,
-                "BB10": 5,
-                "BB11": 6,
-                "BB12": 7,
-                "BB13": 8,
-                "BB14": 9,
-                "GSF10": 15,
-                "GSF11": 16,
-                "GSF12": 17,
-                "GSF13": 18,
-                "GSF14": 19,
-                "MDF10": 20,
-                "MDF11": 21,
-                "MDF12": 22,
-                "MDF13": 23,
-                "MDF14": 24,
-                "SiBF10": 25,
-                "SiBF11": 26,
-                "SiBF12": 27,
-                "SiBF13": 28,
-                "SiBF14": 29,
-            }
-        elif self.data_split == "test":
-            self.seq_multiview_dict = {
-                "GPMF10": 10,
-                "GPMF11": 11,
-                "GPMF12": 12,
-                "GPMF13": 13,
-                "GPMF14": 14,
-                "SB10": 30,
-                "SB11": 31,
-                "SB12": 32,
-                "SB13": 33,
-                "SB14": 34,
-            }
-        # "SB11": 31, "SB13": 33 (series SB1 is split in "train" and "evaluation")
-        if self.add_evalset_train:
-            self.seq_eval = {"SB11": 31, "SB13": 33}
-        else:
-            self.seq_multiview_dict = self.seq_multiview_dict[:-5]
+        self.seq_multiview_dict, self.seq_eval = self._build_mv_split()
 
         # 10: side_view_facing_whiteboard
         # 11: top_view_facing_desk
@@ -789,11 +839,10 @@ class HO3Dv3MultiView(torch.utils.data.Dataset):
         seq_frames, subfolder = self._load_seq_frames_multiview()
 
         if self.split_mode in ['paper', 'v2', 'v3']:  # full view mode
-            #source_set_name = f"{self.split_mode}_{self.data_split}"  # eg paper_train
-            source_set_name = f"{self.split_mode}_train"
+            source_set_name = self._resolve_mv_source_set_name()
             self._mapping_multiview(seq_frames=seq_frames)
 
-            if self.data_split == "test" and self.add_evalset_train:
+            if self.data_split == "test" and self.mv_split_mode == "legacy" and self.add_evalset_train:
                 info_path_eval = os.path.join(self.root, "evaluation.txt")
                 with open(info_path_eval, "r") as f:
                     lines = f.readlines()
@@ -806,7 +855,50 @@ class HO3Dv3MultiView(torch.utils.data.Dataset):
             raise ValueError(f"{self.split_mode} is not supported")
 
         logger.warning(
-            f"{self.name} {self.split_mode}_{self.data_split} Init Done. {len(self.multiview_sample_idxs)} samples")
+            f"{self.name} {self.mv_split_mode}_{self.split_mode}_{self.data_split} Init Done. "
+            f"{len(self.multiview_sample_idxs)} samples")
+
+    def _build_mv_split(self):
+        legacy_train = {
+            "ABF10": 0, "ABF11": 1, "ABF12": 2, "ABF13": 3, "ABF14": 4,
+            "BB10": 5, "BB11": 6, "BB12": 7, "BB13": 8, "BB14": 9,
+            "GSF10": 15, "GSF11": 16, "GSF12": 17, "GSF13": 18, "GSF14": 19,
+            "MDF10": 20, "MDF11": 21, "MDF12": 22, "MDF13": 23, "MDF14": 24,
+            "SiBF10": 25, "SiBF11": 26, "SiBF12": 27, "SiBF13": 28, "SiBF14": 29,
+        }
+        legacy_test = {
+            "GPMF10": 10, "GPMF11": 11, "GPMF12": 12, "GPMF13": 13, "GPMF14": 14,
+            "SB10": 30, "SB11": 31, "SB12": 32, "SB13": 33, "SB14": 34,
+        }
+        artiboost_like_train = {
+            "ABF10": 0, "ABF11": 1, "ABF12": 2, "ABF13": 3, "ABF14": 4,
+            "BB10": 5, "BB11": 6, "BB12": 7, "BB13": 8, "BB14": 9,
+            "GPMF10": 10, "GPMF11": 11, "GPMF12": 12, "GPMF13": 13, "GPMF14": 14,
+            "GSF10": 15, "GSF11": 16, "GSF12": 17, "GSF13": 18, "GSF14": 19,
+            "MDF10": 20, "MDF11": 21, "MDF12": 22, "MDF13": 23, "MDF14": 24,
+            "SiBF10": 25, "SiBF11": 26, "SiBF12": 27, "SiBF13": 28, "SiBF14": 29,
+        }
+        artiboost_like_test = {
+            "AP10": 30, "AP11": 31, "AP12": 32, "AP13": 33, "AP14": 34,
+            "MPM10": 35, "MPM11": 36, "MPM12": 37, "MPM13": 38, "MPM14": 39,
+        }
+
+        if self.mv_split_mode in ["legacy", "poem"]:
+            seq_multiview_dict = legacy_train if self.data_split == "train" else legacy_test
+            seq_eval = {"SB11": 31, "SB13": 33} if self.add_evalset_train else {}
+            return seq_multiview_dict, seq_eval
+
+        if self.mv_split_mode == "artiboost_like":
+            seq_multiview_dict = artiboost_like_train if self.data_split == "train" else artiboost_like_test
+            return seq_multiview_dict, {}
+
+        raise ValueError(f"Unsupported MV_SPLIT_MODE: {self.mv_split_mode}")
+
+    def _resolve_mv_source_set_name(self):
+        if self.mv_split_mode == "artiboost_like":
+            split_name = "train" if self.data_split == "train" else "test"
+            return f"{self.split_mode}_{split_name}"
+        return f"{self.split_mode}_train"
 
     def _single_view_ho3d(self):
         cfg_train = dict(
@@ -817,6 +909,7 @@ class HO3Dv3MultiView(torch.utils.data.Dataset):
             DATA_ROOT=self.cfg.DATA_ROOT,
             TRANSFORM=self.cfg.TRANSFORM,
             DATA_PRESET=self.cfg.DATA_PRESET,
+            USE_OFFICIAL_EVAL_GT_JSON=bool(self.cfg.get("USE_OFFICIAL_EVAL_GT_JSON", False)),
         )
 
         cfg_test = cfg_train.copy()
@@ -874,8 +967,12 @@ class HO3Dv3MultiView(torch.utils.data.Dataset):
                 info_path = os.path.join(self.root, "train.txt")
                 subfolder = "train"
             elif self.data_split == "test":
-                info_path = os.path.join(self.root, "train.txt")
-                subfolder = "train"
+                if self.mv_split_mode == "artiboost_like":
+                    info_path = os.path.join(self.root, "evaluation.txt")
+                    subfolder = "evaluation"
+                else:
+                    info_path = os.path.join(self.root, "train.txt")
+                    subfolder = "train"
             else:
                 assert False
             with open(info_path, "r") as f:
@@ -1012,14 +1109,15 @@ class HO3Dv3MultiView(torch.utils.data.Dataset):
         sample["target_cam_extr"] = list()
         sample["cam_serial"] = list()
 
-        idx_list = ['0', '1', '2', '3', '4']
+        available_cam_ids = sorted({int(info["cam_id"]) for info in multiview_info_list})
+        idx_list = [str(cam_id) for cam_id in available_cam_ids]
         const_v_id = -101
         for vi, info in enumerate(multiview_info_list):
             if info["cam_id"] == self.const_cam_id:
                 const_v_id = vi
                 break
         assert const_v_id != -101, f"Cannot find the constant camera serial {self.const_cam_id} in the dataset"
-        idx_list.pop(self.const_cam_id)
+        idx_list.remove(str(self.const_cam_id))
         idx_list.insert(0, str(self.const_cam_id))
 
         for idx in idx_list:
@@ -1043,7 +1141,7 @@ class HO3Dv3MultiView(torch.utils.data.Dataset):
                     elif cam_id == 4:
                         cam_id = true_cam_orders[4]
 
-                    T_master_2_cam = extr_mapping[cam_id]
+                    T_master_2_cam = extr_mapping.get(cam_id, extr_mapping[int(info["cam_id"])])
                     sample["target_cam_extr"].append(T_master_2_cam)
 
                     cam_serial = info["seq_name"]

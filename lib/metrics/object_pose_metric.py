@@ -139,8 +139,8 @@ class ObjectPoseMetric(Metric):
             transforms = self._get_symmetry_transformations(obj_meta)
             obj_R = np.stack([trans["R"] for trans in transforms], axis=0)
             obj_t = np.stack([trans["t"] for trans in transforms], axis=0)
-            self._symmetry_R[obj_id] = torch.from_numpy(obj_R)
-            self._symmetry_t[obj_id] = torch.from_numpy(obj_t)
+            self._symmetry_R[obj_id] = torch.as_tensor(obj_R)
+            self._symmetry_t[obj_id] = torch.as_tensor(obj_t)
         self._mssd_enabled = True
 
     @staticmethod
@@ -257,8 +257,8 @@ class ObjectPoseMetric(Metric):
 
     def __str__(self) -> str:
         return (
-            f"{self.name} ADD/ADDS {self.add.avg * 1000.0:.1f}/{self.adds.avg * 1000.0:.1f} mm | "
-            f"MSSD {self.mssd.avg * 1000.0:.1f} mm | "
-            f"T {self.trans_epe.avg * 1000.0:.1f} mm | "
-            f"R {self.rot_deg.avg:.1f} deg"
+            f"{self.name} MSSD {self.mssd.avg * 1000.0:.1f} mm | "
+            f"ADD-S {self.adds.avg * 1000.0:.1f} mm | "
+            f"ADD {self.add.avg * 1000.0:.1f} mm | "
+            f"T {self.trans_epe.avg * 1000.0:.1f} mm"
         )

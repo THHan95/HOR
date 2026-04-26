@@ -41,6 +41,7 @@ class HDataset(torch.utils.data.Dataset, ABC):
         self.bbox_expand_ratio = float(cfg.DATA_PRESET.BBOX_EXPAND_RATIO)
         self.image_size = cfg.DATA_PRESET.IMAGE_SIZE  # (W, H)
         self.data_preset = cfg.DATA_PRESET
+        self.crop_model = str(cfg.DATA_PRESET.get("CROP_MODEL", "hand_obj")).lower()
 
         self.center_idx = int(cfg.DATA_PRESET.CENTER_IDX)
         self.sides = CONST.SIDE

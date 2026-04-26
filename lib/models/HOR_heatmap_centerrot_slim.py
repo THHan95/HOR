@@ -771,7 +771,12 @@ class POEM_HeatmapCenterRotSlim(POEM_HeatmapCenterRot):
         pred_mano_2d_mesh_sv = preds["mano_2d_mesh_sv"].view(batch_size, n_views, self.num_hand_verts + self.num_hand_joints, 2)
         pred_sv_joints_2d = self._normed_uv_to_pixel(pred_mano_2d_mesh_sv[:, :, self.num_hand_verts:], (img_h, img_w))
         pred_sv_verts_2d = self._normed_uv_to_pixel(pred_mano_2d_mesh_sv[:, :, :self.num_hand_verts], (img_h, img_w))
-        gt_joints_2d = self._normed_uv_to_pixel(batch["target_joints_uvd"][..., :2], (img_h, img_w))
+        gt_joints_2d_from_uvd = self._normed_uv_to_pixel(batch["target_joints_uvd"][..., :2], (img_h, img_w))
+        gt_joints_2d = batch.get("target_joints_2d", None)
+        if gt_joints_2d is None:
+            gt_joints_2d = gt_joints_2d_from_uvd
+        else:
+            gt_joints_2d = gt_joints_2d.to(device=img.device, dtype=img.dtype)
         gt_verts_2d = self._normed_uv_to_pixel(batch["target_verts_uvd"][..., :2], (img_h, img_w))
 
         pred_obj_center_2d = preds["pred_obj_pixel"].view(batch_size, n_views, self.num_obj_joints, 2)
@@ -835,6 +840,20 @@ class POEM_HeatmapCenterRotSlim(POEM_HeatmapCenterRot):
             tile_batch_images(
                 draw_batch_joint_images(
                     pred_sv_joints_2d_views,
+                    gt_joints_2d_views,
+                    img_views,
+                    step_idx,
+                    n_sample=n_views,
+                )
+            ),
+            step_idx,
+            dataformats="HWC",
+        )
+        self.summary.add_image(
+            f"{tag_prefix}/debug_gt_hand_consistency_2d",
+            tile_batch_images(
+                draw_batch_joint_images(
+                    gt_joints_2d_from_uvd[batch_id],
                     gt_joints_2d_views,
                     img_views,
                     step_idx,

@@ -141,6 +141,153 @@ def draw_batch_mesh_images_pred(
     return sample_array
 
 
+def draw_batch_object_point_cloud_images(
+    gt_obj_points2d,
+    pred_obj_points2d,
+    tensor_image,
+    gt_corners2d=None,
+    pred_corners2d=None,
+    gt_objc2d=None,
+    pred_objc2d=None,
+    pred_obj_rot_error=None,
+    pred_obj_trans_error=None,
+    n_sample=16,
+    max_points=512,
+    point_radius=1,
+):
+    batch_size = pred_obj_points2d.shape[0]
+    if n_sample >= batch_size:
+        n_sample = batch_size
+
+    tensor_image = tensor_image[:n_sample, ...].detach().cpu()
+    image = bchw_2_bhwc(denormalize(tensor_image, [0.5, 0.5, 0.5], [1, 1, 1], inplace=False))
+    image = image.mul_(255.0).numpy().astype(np.uint8)
+
+    gt_obj_points2d = _tensor_to_safe_numpy(gt_obj_points2d, n_sample=n_sample, nan_value=-1.0)
+    pred_obj_points2d = _tensor_to_safe_numpy(pred_obj_points2d, n_sample=n_sample, nan_value=-1.0)
+    gt_corners2d = _tensor_to_safe_numpy(gt_corners2d, n_sample=n_sample, nan_value=-1.0)
+    pred_corners2d = _tensor_to_safe_numpy(pred_corners2d, n_sample=n_sample, nan_value=-1.0)
+    gt_objc2d = _tensor_to_safe_numpy(gt_objc2d, n_sample=n_sample, nan_value=-1.0)
+    pred_objc2d = _tensor_to_safe_numpy(pred_objc2d, n_sample=n_sample, nan_value=-1.0)
+    pred_obj_rot_error = _tensor_to_safe_numpy(pred_obj_rot_error, n_sample=n_sample, nan_value=0.0)
+    pred_obj_trans_error = _tensor_to_safe_numpy(pred_obj_trans_error, n_sample=n_sample, nan_value=0.0)
+
+    def _broadcast_first_dim(value):
+        if value is None:
+            return None
+        if value.shape[0] == 1 and n_sample > 1:
+            repeat_shape = [n_sample] + [1] * (value.ndim - 1)
+            value = np.tile(value, repeat_shape)
+        return value
+
+    gt_corners2d = _broadcast_first_dim(gt_corners2d)
+    pred_corners2d = _broadcast_first_dim(pred_corners2d)
+    gt_objc2d = _broadcast_first_dim(gt_objc2d)
+    pred_objc2d = _broadcast_first_dim(pred_objc2d)
+    pred_obj_rot_error = _broadcast_first_dim(pred_obj_rot_error)
+    pred_obj_trans_error = _broadcast_first_dim(pred_obj_trans_error)
+
+    def _subsample_points(points):
+        if points is None:
+            return None
+        if points.shape[0] <= max_points:
+            return points
+        take_idx = np.linspace(0, points.shape[0] - 1, max_points).astype(np.int32)
+        return points[take_idx]
+
+    def _draw_points(canvas, points, color):
+        if points is None:
+            return canvas
+        points = _subsample_points(points)
+        for point in points:
+            if not np.all(np.isfinite(point)):
+                continue
+            x = int(round(float(point[0])))
+            y = int(round(float(point[1])))
+            if 0 <= x < canvas.shape[1] and 0 <= y < canvas.shape[0]:
+                cv2.circle(canvas, (x, y), point_radius, color, -1, lineType=cv2.LINE_AA)
+        return canvas
+
+    def _draw_center(canvas, center, color):
+        if center is None:
+            return canvas
+        center = center.reshape(-1, 2)
+        for point in center:
+            if not np.all(np.isfinite(point)):
+                continue
+            x = int(round(float(point[0])))
+            y = int(round(float(point[1])))
+            if 0 <= x < canvas.shape[1] and 0 <= y < canvas.shape[0]:
+                cv2.circle(canvas, (x, y), 4, color, -1, lineType=cv2.LINE_AA)
+                cv2.circle(canvas, (x, y), 7, color, 1, lineType=cv2.LINE_AA)
+        return canvas
+
+    sample_list = []
+    for i in range(n_sample):
+        pred_img = image[i].copy()
+        gt_img = image[i].copy()
+
+        if pred_corners2d is not None:
+            pred_img = draw_2d_skeleton(pred_img, joints_uv=None, corners_uv=pred_corners2d[i])
+        if gt_corners2d is not None:
+            gt_img = draw_2d_skeleton(gt_img, joints_uv=None, corners_uv=gt_corners2d[i])
+
+        pred_img = _draw_points(pred_img, pred_obj_points2d[i], color=(0, 165, 255))
+        gt_img = _draw_points(gt_img, gt_obj_points2d[i], color=(80, 200, 120))
+        pred_img = _draw_center(pred_img, None if pred_objc2d is None else pred_objc2d[i], color=(0, 120, 255))
+        gt_img = _draw_center(gt_img, None if gt_objc2d is None else gt_objc2d[i], color=(60, 220, 60))
+
+        cv2.putText(
+            pred_img,
+            "Pred PC + BBox",
+            (10, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (30, 90, 220),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            gt_img,
+            "GT PC + BBox",
+            (10, 22),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (30, 160, 60),
+            1,
+            cv2.LINE_AA,
+        )
+
+        if pred_obj_rot_error is not None:
+            cv2.putText(
+                pred_img,
+                f"rot err {float(pred_obj_rot_error[i].reshape(-1)[0]):.1f} deg",
+                (10, 44),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (220, 90, 30),
+                1,
+                cv2.LINE_AA,
+            )
+        if pred_obj_trans_error is not None:
+            cv2.putText(
+                pred_img,
+                f"tr err {float(pred_obj_trans_error[i].reshape(-1)[0]):.1f} mm",
+                (10, 66),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (30, 140, 220),
+                1,
+                cv2.LINE_AA,
+            )
+
+        sample = np.hstack([pred_img, gt_img])
+        sample = cv2.copyMakeBorder(sample, 5, 5, 5, 5, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        sample_list.append(sample[None, ...])
+
+    return np.concatenate(sample_list, axis=0)
+
+
 def draw_batch_hand_mesh_images_2d(gt_verts2d, pred_verts2d, face, tensor_image, n_sample=16):
     batch_size = gt_verts2d.shape[0]
     if n_sample >= batch_size:

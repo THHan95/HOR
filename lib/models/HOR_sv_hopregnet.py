@@ -11,7 +11,8 @@ from ..utils.logger import logger
 from ..utils.misc import CONST
 from ..utils.transform import batch_cam_intr_projection, batch_persp_project, rot6d_to_rotmat
 from ..viztools.draw import (
-    draw_batch_master_space_3d,
+    draw_batch_hand_mesh_images_2d,
+    draw_batch_joint_images,
     draw_batch_object_point_cloud_images,
     tile_batch_images,
 )
@@ -222,12 +223,69 @@ class POEM_SV_HOPRegNet(POEM_HeatmapCenterRotSlim):
             f"{active_params_m:.3f}M"
         )
 
+    def _ensure_view_batch(self, batch):
+        """Allow the HOPRegNet branch to consume true single-view batches."""
+        img = batch["image"]
+        if img.dim() == 5:
+            return batch
+        if img.dim() != 4:
+            raise ValueError(f"Expected `image` to have 4 or 5 dims, got {tuple(img.shape)}")
+
+        batch_size = img.shape[0]
+        adapted = {}
+        for key, value in batch.items():
+            if (
+                torch.is_tensor(value)
+                and value.shape[:1] == (batch_size,)
+                and not key.startswith("master_")
+                and key not in {"master_id"}
+            ):
+                adapted[key] = value.unsqueeze(1)
+            else:
+                adapted[key] = value
+
+        device = img.device
+        dtype = img.dtype
+        if "target_cam_extr" not in adapted:
+            adapted["target_cam_extr"] = torch.eye(4, device=device, dtype=dtype).view(1, 1, 4, 4).repeat(
+                batch_size, 1, 1, 1
+            )
+        if "master_id" not in adapted:
+            adapted["master_id"] = torch.zeros(batch_size, device=device, dtype=torch.long)
+
+        def _first_available(*keys):
+            for source_key in keys:
+                value = adapted.get(source_key, None)
+                if torch.is_tensor(value):
+                    if value.dim() >= 2 and value.shape[1] == 1:
+                        return value[:, 0]
+                    return value
+            return None
+
+        master_map = {
+            "master_joints_3d": ("target_joints_3d_no_rot", "target_joints_3d"),
+            "master_verts_3d": ("target_verts_3d_no_rot", "target_verts_3d"),
+            "master_obj_kp21": ("target_obj_kp21_no_rot", "target_obj_kp21"),
+            "master_obj_kp21_rest": ("target_obj_kp21_rest", "obj_kp21_rest"),
+            "master_obj_sparse": ("target_obj_sparse_no_rot", "target_obj_pc_sparse", "obj_pc_sparse"),
+            "master_obj_sparse_rest": ("target_obj_pc_sparse_rest", "obj_pc_sparse_rest"),
+            "master_obj_eval_rest": ("target_obj_pc_eval_rest", "obj_pc_eval_rest"),
+            "master_obj_rot6d_label": ("target_rot6d_label", "rot6d_label"),
+            "master_obj_t_label_rel": ("target_t_label_rel", "t_label_rel"),
+        }
+        for target_key, source_keys in master_map.items():
+            if target_key not in adapted:
+                master_value = _first_available(*source_keys)
+                if master_value is not None:
+                    adapted[target_key] = master_value
+
+        return adapted
+
     def set_train_stage(self, stage_name: str):
+        requested_stage = stage_name
+        stage_name = "stage1"
         self.current_stage_name = stage_name
-        if not hasattr(self, "current_stage2_warmup"):
-            self.current_stage2_warmup = 1.0
-        if stage_name != "stage2":
-            self.current_stage2_warmup = 1.0
+        self.current_stage2_warmup = 0.0
 
         modules_to_enable = [
             getattr(self, "img_backbone", None),
@@ -245,10 +303,202 @@ class POEM_SV_HOPRegNet(POEM_HeatmapCenterRotSlim):
         frozen_params = sum(p.numel() for p in self.parameters() if not p.requires_grad)
         if self.debug_logs:
             logger.warning(
-                f"[StageFreeze][HOPRegNet] stage={stage_name} "
+                f"[StageFreeze][HOPRegNet] requested_stage={requested_stage} forced_stage={stage_name} "
                 f"trainable={trainable_params / 1e6:.2f}M "
                 f"frozen={frozen_params / 1e6:.2f}M"
             )
+
+    def _resolve_stage(self, epoch_idx):
+        return "stage1"
+
+    @staticmethod
+    def _stage_to_interaction_mode(stage_name):
+        return "hand"
+
+    def _feed_sv_object_recon(self, preds, batch, use_full_recon_eval=False):
+        obj_eval_rest = batch.get("master_obj_eval_rest", None) if use_full_recon_eval else None
+        if (
+            obj_eval_rest is not None
+            and preds.get("obj_view_rot6d_cam", None) is not None
+            and preds.get("obj_view_trans", None) is not None
+            and batch.get("target_rot6d_label", None) is not None
+            and batch.get("target_t_label_rel", None) is not None
+            and batch.get("target_joints_3d", None) is not None
+        ):
+            pred_sv_obj_dense_3d = self._build_object_points_from_hand_pose(
+                obj_eval_rest,
+                preds["obj_view_rot6d_cam"],
+                batch["target_joints_3d"][:, :, self.center_idx:self.center_idx + 1],
+                preds["obj_view_trans"],
+            )
+            gt_sv_obj_dense_3d = self._build_object_points_from_hand_pose(
+                obj_eval_rest,
+                batch["target_rot6d_label"],
+                batch["target_joints_3d"][:, :, self.center_idx:self.center_idx + 1],
+                batch["target_t_label_rel"],
+            )
+            self.OBJ_RECON_SV.feed(pred_sv_obj_dense_3d.flatten(0, 1), gt_sv_obj_dense_3d.flatten(0, 1))
+            return
+
+        obj_pc_sparse = batch.get("target_obj_pc_sparse", None)
+        if (
+            obj_pc_sparse is not None
+            and preds.get("obj_view_rot6d_cam", None) is not None
+            and preds.get("obj_view_trans", None) is not None
+        ):
+            pred_sv_obj_sparse_3d = self._build_object_points_from_hand_pose(
+                batch["master_obj_sparse_rest"],
+                preds["obj_view_rot6d_cam"],
+                batch["target_joints_3d"][:, :, self.center_idx:self.center_idx + 1],
+                preds["obj_view_trans"],
+            )
+            self.OBJ_RECON_SV.feed(pred_sv_obj_sparse_3d.flatten(0, 1), obj_pc_sparse.flatten(0, 1))
+
+    def training_step(self, batch, step_idx, **kwargs):
+        batch = self._ensure_view_batch(batch)
+        img = batch["image"]
+        batch_size = img.size(0)
+        epoch_idx = kwargs.get("epoch_idx", 0)
+        stage_name = self._resolve_stage(epoch_idx)
+        self.current_stage_name = stage_name
+        self.current_stage2_warmup = 0.0
+
+        preds = self._forward_impl(batch, interaction_mode="hand")
+        self._maybe_log_stage_transition("train", epoch_idx, stage_name, preds, batch)
+
+        loss, loss_dict = self.compute_loss(preds, batch, stage_name=stage_name, epoch_idx=epoch_idx)
+        sv_obj_metric_dict = self.compute_sv_object_pose_metrics(preds, batch)
+        metrics_finite = self._metric_dict_is_finite(sv_obj_metric_dict)
+        loss_finite = self._loss_dict_is_finite(loss_dict)
+        if (not loss_finite) or (not metrics_finite):
+            logger.warning(
+                f"[TrainNonFiniteEarlyExit] epoch={epoch_idx} stage={stage_name} step={step_idx} "
+                f"loss_finite={loss_finite} sv_metrics_finite={metrics_finite}"
+            )
+            self._maybe_log_stage_transition_loss("train", epoch_idx, stage_name, loss_dict, sv_obj_metric_dict)
+            return None, loss_dict
+
+        pred_mano_3d_mesh_sv = preds["mano_3d_mesh_sv"]
+        pred_mano_3d_joints_sv = pred_mano_3d_mesh_sv[:, self.num_hand_verts:]
+        pred_mano_3d_verts_sv = pred_mano_3d_mesh_sv[:, :self.num_hand_verts]
+        joints_3d_rel_gt = batch["target_joints_3d_rel"].flatten(0, 1)
+        verts_3d_rel_gt = batch["target_verts_3d_rel"].flatten(0, 1)
+
+        self.MPJPE_SV_3D.feed(pred_mano_3d_joints_sv, gt_kp=joints_3d_rel_gt)
+        self.MPVPE_SV_3D.feed(pred_mano_3d_verts_sv, gt_kp=verts_3d_rel_gt)
+        self.PA_SV.feed(pred_mano_3d_joints_sv, joints_3d_rel_gt, pred_mano_3d_verts_sv, verts_3d_rel_gt)
+        self._feed_sv_object_recon(preds, batch, use_full_recon_eval=False)
+
+        metric_log_dict = dict(sv_obj_metric_dict)
+        self.loss_metric.feed({**loss_dict, **metric_log_dict}, batch_size)
+        self._maybe_log_stage_transition_loss("train", epoch_idx, stage_name, loss_dict, metric_log_dict)
+
+        if self.summary is not None and step_idx % self.train_log_interval == 0:
+            for k, v in loss_dict.items():
+                self.summary.add_scalar(k, v.item(), step_idx)
+            for k, v in metric_log_dict.items():
+                self.summary.add_scalar(k, v.item(), step_idx)
+            pa_sv = self.PA_SV.get_measures()
+            self.summary.add_scalar("MPJPE_SV_3D", self.MPJPE_SV_3D.get_result(), step_idx)
+            self.summary.add_scalar("MPVPE_SV_3D", self.MPVPE_SV_3D.get_result(), step_idx)
+            self.summary.add_scalar("PA_SV_J", pa_sv["pa_mpjpe"], step_idx)
+            self.summary.add_scalar("PA_SV_V", pa_sv["pa_mpvpe"], step_idx)
+            self.summary.add_scalar("OBJREC_SV_CD", self.OBJ_RECON_SV.cd.avg, step_idx)
+            self.summary.add_scalar("OBJREC_SV_FS_5", self.OBJ_RECON_SV.fs_5.avg, step_idx)
+            self.summary.add_scalar("OBJREC_SV_FS_10", self.OBJ_RECON_SV.fs_10.avg, step_idx)
+            if step_idx % (self.train_log_interval * 10) == 0:
+                with torch.no_grad():
+                    self._log_visualizations("train", batch, preds, step_idx, stage_name)
+
+        return None, loss_dict
+
+    def on_train_finished(self, recorder, epoch_idx, **kwargs):
+        comment = f"{self.name}-train"
+        recorder.record_loss(self.loss_metric, epoch_idx, comment=comment)
+        recorder.record_metric(
+            [self.MPJPE_SV_3D, self.MPVPE_SV_3D, self.PA_SV, self.OBJ_RECON_SV],
+            epoch_idx,
+            comment=comment,
+            summary=self.format_metric(mode="train"),
+        )
+        self.loss_metric.reset()
+        self.MPJPE_SV_3D.reset()
+        self.MPVPE_SV_3D.reset()
+        self.PA_SV.reset()
+        self.OBJ_RECON_SV.reset()
+
+    def validation_step(self, batch, step_idx, **kwargs):
+        batch = self._ensure_view_batch(batch)
+        img = batch["image"]
+        batch_size = img.size(0)
+        epoch_idx = kwargs.get("epoch_idx", 0)
+        stage_name = self._resolve_stage(epoch_idx)
+        self.current_stage_name = stage_name
+        self.current_stage2_warmup = 0.0
+        use_full_recon_eval = self._use_full_val_recon(epoch_idx)
+        self.current_val_recon_mode = "full" if use_full_recon_eval else "fast"
+
+        preds = self._forward_impl(batch, interaction_mode="hand")
+        self._maybe_log_stage_transition("val", epoch_idx, stage_name, preds, batch)
+
+        sv_obj_metric_dict = self.compute_sv_object_pose_metrics(preds, batch)
+        if not self._metric_dict_is_finite(sv_obj_metric_dict):
+            logger.warning(
+                f"[ValNonFiniteEarlyExit] epoch={epoch_idx} stage={stage_name} step={step_idx} "
+                "sv_metrics_finite=False"
+            )
+            self._maybe_log_stage_transition_loss("val", epoch_idx, stage_name, {}, sv_obj_metric_dict)
+            return None
+
+        pred_mano_3d_mesh_sv = preds["mano_3d_mesh_sv"]
+        pred_mano_3d_joints_sv = pred_mano_3d_mesh_sv[:, self.num_hand_verts:]
+        pred_mano_3d_verts_sv = pred_mano_3d_mesh_sv[:, :self.num_hand_verts]
+        joints_3d_rel_gt = batch["target_joints_3d_rel"].flatten(0, 1)
+        verts_3d_rel_gt = batch["target_verts_3d_rel"].flatten(0, 1)
+
+        self.MPJPE_SV_3D.feed(pred_mano_3d_joints_sv, gt_kp=joints_3d_rel_gt)
+        self.MPVPE_SV_3D.feed(pred_mano_3d_verts_sv, gt_kp=verts_3d_rel_gt)
+        self.PA_SV.feed(pred_mano_3d_joints_sv, joints_3d_rel_gt, pred_mano_3d_verts_sv, verts_3d_rel_gt)
+        self._feed_sv_object_recon(preds, batch, use_full_recon_eval=use_full_recon_eval)
+
+        metric_log_dict = dict(sv_obj_metric_dict)
+        self.loss_metric.feed(metric_log_dict, batch_size)
+        self._maybe_log_stage_transition_loss("val", epoch_idx, stage_name, {}, metric_log_dict)
+
+        if self.summary is not None:
+            pa_sv = self.PA_SV.get_measures()
+            self.summary.add_scalar("MPJPE_SV_3D_val", self.MPJPE_SV_3D.get_result(), step_idx)
+            self.summary.add_scalar("MPVPE_SV_3D_val", self.MPVPE_SV_3D.get_result(), step_idx)
+            self.summary.add_scalar("PA_SV_J_val", pa_sv["pa_mpjpe"], step_idx)
+            self.summary.add_scalar("PA_SV_V_val", pa_sv["pa_mpvpe"], step_idx)
+            self.summary.add_scalar("OBJREC_SV_CD_val", self.OBJ_RECON_SV.cd.avg, step_idx)
+            self.summary.add_scalar("OBJREC_SV_FS_5_val", self.OBJ_RECON_SV.fs_5.avg, step_idx)
+            self.summary.add_scalar("OBJREC_SV_FS_10_val", self.OBJ_RECON_SV.fs_10.avg, step_idx)
+            self.summary.add_scalar("VAL_RECON_IS_FULL_val", float(use_full_recon_eval), step_idx)
+            for k, v in metric_log_dict.items():
+                self.summary.add_scalar(f"{k}_val", v.item(), step_idx)
+            if step_idx % (self.train_log_interval * 5) == 0:
+                with torch.no_grad():
+                    self._log_visualizations("val", batch, preds, step_idx, stage_name)
+
+        return None
+
+    def on_val_finished(self, recorder, epoch_idx, **kwargs):
+        comment = f"{self.name}-val"
+        recorder.record_metric(
+            [self.MPJPE_SV_3D, self.MPVPE_SV_3D, self.PA_SV, self.OBJ_RECON_SV],
+            epoch_idx,
+            comment=comment,
+            summary=self.format_metric(mode="val_full"),
+        )
+        self.MPJPE_SV_3D.reset()
+        self.MPVPE_SV_3D.reset()
+        self.PA_SV.reset()
+        self.OBJ_RECON_SV.reset()
+        self.loss_metric.reset()
+
+    def testing_step(self, batch, step_idx, **kwargs):
+        return self.validation_step(batch, step_idx, **kwargs)
 
     def _compute_hand_ord_loss(self, pred_joints_abs, gt_joints_abs, joint_valid):
         pred_masked = pred_joints_abs * joint_valid.unsqueeze(-1).to(dtype=pred_joints_abs.dtype)
@@ -331,6 +581,7 @@ class POEM_SV_HOPRegNet(POEM_HeatmapCenterRotSlim):
         return F.mse_loss(pred * valid, gt * valid)
 
     def _forward_impl(self, batch, **kwargs):
+        batch = self._ensure_view_batch(batch)
         img = batch["image"]
         batch_size, num_cams = img.shape[:2]
         img_h, img_w = img.shape[-2:]
@@ -457,7 +708,7 @@ class POEM_SV_HOPRegNet(POEM_HeatmapCenterRotSlim):
             "all_hand_joints_xyz_master": pred_ref_hand.unsqueeze(0),
         }
 
-    def compute_loss(self, preds, gt, stage_name="stage2", epoch_idx=None, **kwargs):
+    def compute_loss(self, preds, gt, stage_name="stage1", epoch_idx=None, **kwargs):
         zero = preds["mano_3d_mesh_sv"].sum() * 0.0
         batch_size, num_views = gt["image"].shape[:2]
         dtype = preds["mano_3d_mesh_sv"].dtype
@@ -604,30 +855,26 @@ class POEM_SV_HOPRegNet(POEM_HeatmapCenterRotSlim):
         return total_loss, loss_dict
 
     def _log_visualizations(self, mode, batch, preds, step_idx, stage_name):
-        super()._log_visualizations(mode, batch, preds, step_idx, stage_name)
         if self.summary is None or not hasattr(self.summary, "add_image"):
             return
 
         img = batch["image"]
         batch_size, n_views = img.shape[:2]
+        img_h, img_w = img.shape[-2:]
         batch_id = 0
 
         K_gt = batch["target_cam_intr"].to(device=img.device, dtype=img.dtype)
-        T_c2m_gt = torch.linalg.inv(batch["target_cam_extr"]).to(device=img.device, dtype=img.dtype)
 
-        pred_obj_sparse_master = preds.get("obj_xyz_master", None)
-        gt_obj_sparse_master = batch.get("master_obj_sparse", None)
-        if pred_obj_sparse_master is not None:
-            pred_obj_sparse_master = pred_obj_sparse_master[-1]
-
-        if pred_obj_sparse_master is None or gt_obj_sparse_master is None:
-            return
-
-        _, pred_obj_sparse_2d = self._project_master_points(pred_obj_sparse_master, T_c2m_gt, K_gt)
-        _, gt_obj_sparse_2d = self._project_master_points(
-            gt_obj_sparse_master.to(device=img.device, dtype=img.dtype),
-            T_c2m_gt,
-            K_gt,
+        pred_mano_2d_mesh_sv = preds["mano_2d_mesh_sv"].view(batch_size, n_views, self.num_hand_verts + self.num_hand_joints, 2)
+        pred_sv_joints_2d = self._normed_uv_to_pixel(pred_mano_2d_mesh_sv[:, :, self.num_hand_verts:], (img_h, img_w))
+        pred_sv_verts_2d = self._normed_uv_to_pixel(pred_mano_2d_mesh_sv[:, :, :self.num_hand_verts], (img_h, img_w))
+        gt_joints_2d = self._normed_uv_to_pixel(
+            batch["target_joints_uvd"][..., :2].to(device=img.device, dtype=img.dtype),
+            (img_h, img_w),
+        )
+        gt_verts_2d = self._normed_uv_to_pixel(
+            batch["target_verts_uvd"][..., :2].to(device=img.device, dtype=img.dtype),
+            (img_h, img_w),
         )
 
         pred_corners_2d = batch_cam_intr_projection(
@@ -643,6 +890,29 @@ class POEM_SV_HOPRegNet(POEM_HeatmapCenterRotSlim):
             K_gt,
             batch["target_obj_kp21"][:, :, -self.num_obj_joints:].to(device=img.device, dtype=img.dtype),
         )
+
+        obj_sparse_rest = batch["master_obj_sparse_rest"].to(device=img.device, dtype=img.dtype)
+        pred_sv_obj_sparse_3d = self._build_object_points_from_hand_pose(
+            obj_sparse_rest,
+            preds["obj_view_rot6d_cam"],
+            batch["target_joints_3d"][:, :, self.center_idx:self.center_idx + 1].to(device=img.device, dtype=img.dtype),
+            preds["obj_view_trans"],
+        )
+        pred_obj_sparse_2d = batch_cam_intr_projection(K_gt, pred_sv_obj_sparse_3d)
+
+        if (
+            batch.get("target_rot6d_label", None) is not None
+            and batch.get("target_t_label_rel", None) is not None
+        ):
+            gt_sv_obj_sparse_3d = self._build_object_points_from_hand_pose(
+                obj_sparse_rest,
+                batch["target_rot6d_label"].to(device=img.device, dtype=img.dtype),
+                batch["target_joints_3d"][:, :, self.center_idx:self.center_idx + 1].to(device=img.device, dtype=img.dtype),
+                batch["target_t_label_rel"].to(device=img.device, dtype=img.dtype),
+            )
+            gt_obj_sparse_2d = batch_cam_intr_projection(K_gt, gt_sv_obj_sparse_3d)
+        else:
+            gt_obj_sparse_2d = None
 
         pred_obj_view_rot_deg = None
         if batch.get("target_rot6d_label", None) is not None and preds.get("obj_view_rot6d_cam", None) is not None:
@@ -668,18 +938,40 @@ class POEM_SV_HOPRegNet(POEM_HeatmapCenterRotSlim):
                 ) * 1000.0
             ).unsqueeze(-1)
 
-        pred_hand_master = preds["mano_3d_mesh_master"]
-        gt_hand_joints_master = batch["master_joints_3d"].to(device=img.device, dtype=img.dtype)
-        gt_hand_verts_master = batch["master_verts_3d"].to(device=img.device, dtype=img.dtype)
-        pred_hand_joints_master = pred_hand_master[:, self.num_hand_verts:]
-        pred_hand_verts_master = pred_hand_master[:, :self.num_hand_verts]
-
         tag_prefix = self._stage_tb_prefix(mode, stage_name)
+        self.summary.add_image(
+            f"{tag_prefix}/hopreg_hand_joints_2d",
+            tile_batch_images(
+                draw_batch_joint_images(
+                    pred_sv_joints_2d[batch_id],
+                    gt_joints_2d[batch_id],
+                    img[batch_id],
+                    step_idx,
+                    n_sample=n_views,
+                )
+            ),
+            step_idx,
+            dataformats="HWC",
+        )
+        self.summary.add_image(
+            f"{tag_prefix}/hopreg_hand_mesh_2d",
+            tile_batch_images(
+                draw_batch_hand_mesh_images_2d(
+                    gt_verts2d=gt_verts_2d[batch_id],
+                    pred_verts2d=pred_sv_verts_2d[batch_id],
+                    face=self.face,
+                    tensor_image=img[batch_id],
+                    n_sample=n_views,
+                )
+            ),
+            step_idx,
+            dataformats="HWC",
+        )
         self.summary.add_image(
             f"{tag_prefix}/hopreg_obj_bbox_pointcloud_2d",
             tile_batch_images(
                 draw_batch_object_point_cloud_images(
-                    gt_obj_points2d=gt_obj_sparse_2d[batch_id],
+                    gt_obj_points2d=None if gt_obj_sparse_2d is None else gt_obj_sparse_2d[batch_id],
                     pred_obj_points2d=pred_obj_sparse_2d[batch_id],
                     tensor_image=img[batch_id],
                     gt_corners2d=gt_corners_2d[batch_id],
@@ -695,29 +987,13 @@ class POEM_SV_HOPRegNet(POEM_HeatmapCenterRotSlim):
             step_idx,
             dataformats="HWC",
         )
-        self.summary.add_image(
-            f"{tag_prefix}/hopreg_obj_pointcloud_master_3d",
-            tile_batch_images(
-                draw_batch_master_space_3d(
-                    gt_hand_joints=gt_hand_joints_master,
-                    pred_hand_joints=pred_hand_joints_master,
-                    gt_hand_verts=gt_hand_verts_master,
-                    pred_hand_verts=pred_hand_verts_master,
-                    gt_obj_pts=gt_obj_sparse_master.to(device=img.device, dtype=img.dtype),
-                    pred_obj_pts=pred_obj_sparse_master,
-                    n_sample=min(1, batch_size),
-                    image_size=(img.shape[-2], img.shape[-1]),
-                    obj_subsample=512,
-                    verts_subsample=256,
-                )
-            ),
-            step_idx,
-            dataformats="HWC",
-        )
 
     def format_metric(self, mode="train"):
         def _mm(value):
             return f"{float(value) * 1000.0:.1f}"
+
+        def _cd(value):
+            return f"{float(value):.3f}"
 
         def _get_meter(name, default=0.0):
             meter = self.loss_metric._losses.get(name, None)
@@ -735,10 +1011,10 @@ class POEM_SV_HOPRegNet(POEM_HeatmapCenterRotSlim):
             m_obj_2d_px = _get_meter("metric_obj_center_2d_epe_px")
             m_obj_c_mm = _get_meter("metric_obj_center_3d_l1_mm")
             m_obj_k_mm = _get_meter("metric_obj_corner_3d_l1_mm")
-            m_obj_depth = _get_meter("metric_obj_center_depth_mm")
             m_sv_rot_deg = _get_meter("metric_sv_obj_rot_deg")
             m_sv_trans_mm = _get_meter("metric_sv_obj_trans_epe")
             m_sv_obj_mssd = _get_meter("metric_sv_obj_mssd")
+            m_sv_obj_cd = float(self.OBJ_RECON_SV.cd.avg)
             sv_j = self.MPJPE_SV_3D.get_result()
             sv_v = self.MPVPE_SV_3D.get_result()
             pa_sv = self.PA_SV.get_measures()
@@ -749,8 +1025,8 @@ class POEM_SV_HOPRegNet(POEM_HeatmapCenterRotSlim):
                 f"Ord H/S {l_ho:.4f}/{l_so:.4f} | "
                 f"H MAJ/V {_mm(sv_j)}/{_mm(sv_v)} PAJ/V {_mm(pa_sv['pa_mpjpe'])}/{_mm(pa_sv['pa_mpvpe'])} | "
                 f"O px/C/K {m_obj_2d_px:.1f}/{m_obj_c_mm:.1f}/{m_obj_k_mm:.1f} | "
-                f"MSSD {_mm(m_sv_obj_mssd)} RT {m_sv_rot_deg:.1f}/{_mm(m_sv_trans_mm)} | "
-                f"Dep {m_obj_depth:.0f}"
+                f"O MSSD/CD {_mm(m_sv_obj_mssd)}/{_cd(m_sv_obj_cd)} | "
+                f"RT {m_sv_rot_deg:.1f}/{_mm(m_sv_trans_mm)}"
             )
 
         if mode in ["val", "val_full"]:
@@ -762,11 +1038,12 @@ class POEM_SV_HOPRegNet(POEM_HeatmapCenterRotSlim):
             sv_obj_add = _get_meter("metric_sv_obj_add")
             sv_obj_adds = _get_meter("metric_sv_obj_adds")
             sv_obj_mssd = _get_meter("metric_sv_obj_mssd")
+            sv_obj_cd = float(self.OBJ_RECON_SV.cd.avg)
             recon_mode = self.current_val_recon_mode.upper()
             return (
                 f"{stage_short} | Rec {recon_mode} | "
                 f"H MAJ/V {_mm(sv_j)}/{_mm(sv_v)} PAJ/V {_mm(pa_sv['pa_mpjpe'])}/{_mm(pa_sv['pa_mpvpe'])} | "
-                f"O A/S/M {_mm(sv_obj_add)}/{_mm(sv_obj_adds)}/{_mm(sv_obj_mssd)} | "
+                f"O A/S/MSSD/CD {_mm(sv_obj_add)}/{_mm(sv_obj_adds)}/{_mm(sv_obj_mssd)}/{_cd(sv_obj_cd)} | "
                 f"RT {sv_obj_rot_deg:.1f}/{_mm(sv_obj_trans_epe)}"
             )
 

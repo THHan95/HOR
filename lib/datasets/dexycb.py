@@ -186,8 +186,8 @@ class DexYCB(HDataset):
         for obj_id, obj_file in self.dex_ycb.obj_file.items():
             object_mesh = trimesh.load(obj_file, process=False)
 
-            verts = torch.from_numpy(object_mesh.vertices).float()
-            faces = torch.from_numpy(object_mesh.faces).long()
+            verts = torch.as_tensor(np.asarray(object_mesh.vertices, dtype=np.float32)).float().clone()
+            faces = torch.as_tensor(np.asarray(object_mesh.faces, dtype=np.int64)).long().clone()
             pt3d_mesh = Meshes(verts=[verts], faces=[faces])
 
             pc_sparse = sample_points_from_meshes(pt3d_mesh, 2048)[0].numpy()
@@ -248,7 +248,7 @@ class DexYCB(HDataset):
             t_obj_cam = t_obj_cam.reshape(3, 1)
         t_label_rel = (t_obj_cam - hand_root_cam).astype(np.float32)
 
-        rot6d_label = rotmat_to_rot6d(torch.from_numpy(R_label).unsqueeze(0)).squeeze(0).numpy().astype(np.float32)
+        rot6d_label = rotmat_to_rot6d(torch.as_tensor(R_label).unsqueeze(0)).squeeze(0).numpy().astype(np.float32)
 
         pc_sparse_cam = (R_obj_cam @ pc_sparse_rest.T).T + t_obj_cam.flatten()
         pc_dense_cam = (R_obj_cam @ pc_dense_rest.T).T + t_obj_cam.flatten()
@@ -368,7 +368,7 @@ class DexYCB(HDataset):
         ori_idx = self.sample_idxs[idx]
         sample = self.dex_ycb[ori_idx]
         label = self.get_label(sample["label_file"])  # keys: seg, pose_y, pose_m, joint_3d, joint_2d
-        pose_m = torch.from_numpy(label["pose_m"])
+        pose_m = torch.as_tensor(label["pose_m"])
         shape = torch.tensor(sample["mano_betas"]).unsqueeze(0)
         mano_layer = self.dexycb_mano_left if sample["mano_side"] == "left" else self.dexycb_mano_right
         mano_out: MANOOutput = mano_layer(pose_m[:, :48], shape)
@@ -424,7 +424,7 @@ class DexYCB(HDataset):
         ori_idx = self.sample_idxs[idx]
         sample = self.dex_ycb[ori_idx]
         label = self.get_label(sample["label_file"])  # keys: seg, pose_y, pose_m, joint_3d, joint_2d
-        pose_m = torch.from_numpy(label["pose_m"])
+        pose_m = torch.as_tensor(label["pose_m"])
         mano_layer = self.dexycb_mano_right if sample["mano_side"] == "right" else self.dexycb_mano_left
         pose = mano_layer.rotation_by_axisang(pose_m[:, :48])["full_poses"]  # (1, 48)
         pose = pose.squeeze(0).numpy().astype(np.float32)
@@ -452,6 +452,10 @@ class DexYCBMultiView(torch.utils.data.Dataset):
         self.use_cache = cfg.DATA_PRESET.USE_CACHE
         assert self.data_split in ["train", "val", "test"], f"{self.name} unsupport data split {self.data_split}"
         self.test_with_multiview = cfg.get("TEST_WITH_MULTIVIEW", False)
+        self.object_coverage_split = bool(cfg.get("OBJECT_COVERAGE_SPLIT", False))
+        self.object_coverage_source_splits = list(cfg.get("OBJECT_COVERAGE_SOURCE_SPLITS", ["train", "val", "test"]))
+        self.object_coverage_train_ratio = float(cfg.get("OBJECT_COVERAGE_TRAIN_RATIO", 0.8))
+        self.object_coverage_seed = int(cfg.get("OBJECT_COVERAGE_SEED", 1))
         self.max_hand_obj_surface_dist_mm = cfg.get("MAX_HAND_OBJ_SURFACE_DIST_MM", 5.0)
         self.enable_hand_obj_contact_filter = (
             self.max_hand_obj_surface_dist_mm is not None and float(self.max_hand_obj_surface_dist_mm) > 0.0
@@ -488,27 +492,14 @@ class DexYCBMultiView(torch.utils.data.Dataset):
         self.multiview_sample_infos = []
 
         if self.setup in ['s0', 's1', 's3']:  # full view mode
-            source_set_name = f"{self.setup}_{self.data_split}"  # eg s0_train
-            source_set: DexYCB = self.set_mappings[source_set_name]
-            multivew_mapping = {}
-            for i, ori_idx in enumerate(source_set.sample_idxs):
-                seq_id, cam_id, frame_id = source_set.dex_ycb._mapping[ori_idx]
-                if (seq_id, frame_id) not in multivew_mapping:
-                    multivew_mapping[(seq_id, frame_id)] = [(cam_id, i)]
-                else:
-                    multivew_mapping[(seq_id, frame_id)].append((cam_id, i))
-
-            for key, value in multivew_mapping.items():
-                seq_id, frame_id = key
-                self.multiview_sample_idxs.append([i for (_, i) in value])
-                self.multiview_sample_infos.append([{
-                    "set_name": source_set_name,
-                    "seq_id": seq_id,
-                    "seq_name": source_set.dex_ycb._sequences[seq_id],
-                    "cam_id": cam_id,
-                    "cam_serial": source_set.dex_ycb._serials[cam_id],
-                    "frame_id": frame_id,
-                } for (cam_id, _) in value])
+            if self.object_coverage_split:
+                self._build_object_coverage_multiview_groups()
+            else:
+                source_set_name = f"{self.setup}_{self.data_split}"  # eg s0_train
+                source_set: DexYCB = self.set_mappings[source_set_name]
+                group_idxs, group_infos = self._build_multiview_groups_from_source(source_set_name, source_set)
+                self.multiview_sample_idxs.extend(group_idxs)
+                self.multiview_sample_infos.extend(group_infos)
         elif self.setup == 's2':  # unseen view mode
             # TODO: ablation
             raise NotImplementedError("s2 is not implemented")
@@ -536,15 +527,14 @@ class DexYCBMultiView(torch.utils.data.Dataset):
 
         total_len = len(self.multiview_sample_idxs)
         base_valid_sample_idx_list = list(range(total_len))
-        if self.enable_hand_obj_contact_filter:
-            base_valid_sample_idx_list = self._filter_multiview_samples_by_surface_distance(base_valid_sample_idx_list)
         if self.skip_frames != 0:
-            self.valid_sample_idx_list = [
+            base_valid_sample_idx_list = [
                 valid_idx for order_idx, valid_idx in enumerate(base_valid_sample_idx_list)
                 if order_idx % (self.skip_frames + 1) == 0
             ]
-        else:
-            self.valid_sample_idx_list = base_valid_sample_idx_list
+        if self.enable_hand_obj_contact_filter:
+            base_valid_sample_idx_list = self._filter_multiview_samples_by_surface_distance(base_valid_sample_idx_list)
+        self.valid_sample_idx_list = base_valid_sample_idx_list
 
         self.len = len(self.valid_sample_idx_list)
         filter_desc = (
@@ -553,7 +543,124 @@ class DexYCBMultiView(torch.utils.data.Dataset):
         )
         logger.warning(f"{self.name} {self.setup}_{self.data_split} Init Done. "
                        f"Skip frames: {self.skip_frames}, total {self.len} samples{filter_desc}")
+        self._log_object_coverage("final")
         self.current_stage_name = "stage3"
+
+    def _build_multiview_groups_from_source(self, source_set_name, source_set):
+        multiview_mapping = {}
+        for i, ori_idx in enumerate(source_set.sample_idxs):
+            seq_id, cam_id, frame_id = source_set.dex_ycb._mapping[ori_idx]
+            if (seq_id, frame_id) not in multiview_mapping:
+                multiview_mapping[(seq_id, frame_id)] = [(cam_id, i)]
+            else:
+                multiview_mapping[(seq_id, frame_id)].append((cam_id, i))
+
+        group_idxs = []
+        group_infos = []
+        for key in sorted(multiview_mapping.keys()):
+            seq_id, frame_id = key
+            value = sorted(multiview_mapping[key], key=lambda item: item[0])
+            group_idxs.append([i for (_, i) in value])
+            group_infos.append([{
+                "set_name": source_set_name,
+                "seq_id": seq_id,
+                "seq_name": source_set.dex_ycb._sequences[seq_id],
+                "cam_id": cam_id,
+                "cam_serial": source_set.dex_ycb._serials[cam_id],
+                "frame_id": frame_id,
+            } for (cam_id, _) in value])
+        return group_idxs, group_infos
+
+    @staticmethod
+    def _get_obj_id_from_source_sample(source_set, source_idx):
+        ori_idx = source_set.sample_idxs[source_idx]
+        sample = source_set.dex_ycb[ori_idx]
+        grasp_ind = sample["ycb_grasp_ind"]
+        return int(sample["ycb_ids"][grasp_ind])
+
+    def _build_object_coverage_multiview_groups(self):
+        rng = random.Random(self.object_coverage_seed)
+        all_group_idxs = []
+        all_group_infos = []
+        all_group_obj_ids = []
+
+        for split in self.object_coverage_source_splits:
+            source_set_name = f"{self.setup}_{split}"
+            if source_set_name not in self.set_mappings:
+                raise ValueError(f"{self.name} unknown OBJECT_COVERAGE_SOURCE_SPLIT: {split}")
+            source_set = self.set_mappings[source_set_name]
+            group_idxs, group_infos = self._build_multiview_groups_from_source(source_set_name, source_set)
+            for idxs, infos in zip(group_idxs, group_infos):
+                obj_id = self._get_obj_id_from_source_sample(source_set, idxs[0])
+                all_group_idxs.append(idxs)
+                all_group_infos.append(infos)
+                all_group_obj_ids.append(obj_id)
+
+        obj_to_groups = {}
+        for group_idx, obj_id in enumerate(all_group_obj_ids):
+            obj_to_groups.setdefault(obj_id, []).append(group_idx)
+
+        selected = []
+        train_ratio = min(max(self.object_coverage_train_ratio, 0.0), 1.0)
+        target_is_train = self.data_split == "train"
+        for obj_id in sorted(obj_to_groups.keys()):
+            group_ids = obj_to_groups[obj_id]
+            seq_to_group_ids = {}
+            for group_id in group_ids:
+                info0 = all_group_infos[group_id][0]
+                seq_key = (info0["set_name"], info0["seq_name"])
+                seq_to_group_ids.setdefault(seq_key, []).append(group_id)
+
+            train_group_ids = set()
+            test_group_ids = set()
+            seq_keys = sorted(seq_to_group_ids.keys())
+            if len(seq_keys) >= 2:
+                rng.shuffle(seq_keys)
+                n_train_seq = int(round(len(seq_keys) * train_ratio))
+                n_train_seq = min(max(n_train_seq, 1), len(seq_keys) - 1)
+                train_seq_keys = set(seq_keys[:n_train_seq])
+                for seq_key, seq_group_ids in seq_to_group_ids.items():
+                    target_set = train_group_ids if seq_key in train_seq_keys else test_group_ids
+                    target_set.update(seq_group_ids)
+            elif len(group_ids) >= 2:
+                shuffled_group_ids = list(group_ids)
+                rng.shuffle(shuffled_group_ids)
+                n_train_group = int(round(len(shuffled_group_ids) * train_ratio))
+                n_train_group = min(max(n_train_group, 1), len(shuffled_group_ids) - 1)
+                train_group_ids.update(shuffled_group_ids[:n_train_group])
+                test_group_ids.update(shuffled_group_ids[n_train_group:])
+            else:
+                logger.warning(
+                    f"{self.name} object coverage split cannot cover obj_id={obj_id} in both train/test "
+                    "because only one multiview group is available"
+                )
+                train_group_ids.update(group_ids)
+
+            selected.extend(train_group_ids if target_is_train else test_group_ids)
+
+        selected = sorted(selected)
+        self.multiview_sample_idxs = [copy.deepcopy(all_group_idxs[group_id]) for group_id in selected]
+        self.multiview_sample_infos = [copy.deepcopy(all_group_infos[group_id]) for group_id in selected]
+        logger.warning(
+            f"{self.name} object coverage split enabled for {self.setup}_{self.data_split}: "
+            f"sources={self.object_coverage_source_splits}, train_ratio={train_ratio:.3f}, "
+            f"seed={self.object_coverage_seed}, selected={len(selected)}/{len(all_group_idxs)} multiview groups"
+        )
+
+    def _log_object_coverage(self, tag):
+        obj_counts = {}
+        for valid_idx in getattr(self, "valid_sample_idx_list", []):
+            multiview_id_list = self.multiview_sample_idxs[valid_idx]
+            multiview_info_list = self.multiview_sample_infos[valid_idx]
+            if not multiview_id_list or not multiview_info_list:
+                continue
+            source_set = self.set_mappings[multiview_info_list[0]["set_name"]]
+            obj_id = self._get_obj_id_from_source_sample(source_set, multiview_id_list[0])
+            obj_counts[obj_id] = obj_counts.get(obj_id, 0) + 1
+        logger.warning(
+            f"{self.name} {self.setup}_{self.data_split} object coverage ({tag}): "
+            f"{sorted(obj_counts.keys())}, counts={obj_counts}"
+        )
 
     def set_stage(self, stage_name: str):
         self.current_stage_name = stage_name
@@ -598,7 +705,12 @@ class DexYCBMultiView(torch.utils.data.Dataset):
             "setup": self.setup,
             "data_split": self.data_split,
             "test_with_multiview": self.test_with_multiview,
+            "skip_frames_before_surface_filter": self.skip_frames,
             "max_hand_obj_surface_dist_mm": float(self.max_hand_obj_surface_dist_mm),
+            "object_coverage_split": self.object_coverage_split,
+            "object_coverage_source_splits": self.object_coverage_source_splits,
+            "object_coverage_train_ratio": self.object_coverage_train_ratio,
+            "object_coverage_seed": self.object_coverage_seed,
             "source_train_cache": getattr(self.set_mappings[f"{self.setup}_train"], "cache_identifier", "na"),
             "source_val_cache": getattr(self.set_mappings[f"{self.setup}_val"], "cache_identifier", "na"),
             "source_test_cache": getattr(self.set_mappings[f"{self.setup}_test"], "cache_identifier", "na"),
@@ -667,8 +779,8 @@ class DexYCBMultiView(torch.utils.data.Dataset):
     def __getitem__(self, idx):
 
         idx = self.valid_sample_idx_list[idx]
-        multiview_id_list = self.multiview_sample_idxs[idx]
-        multiview_info_list = self.multiview_sample_infos[idx]
+        multiview_id_list = copy.deepcopy(self.multiview_sample_idxs[idx])
+        multiview_info_list = copy.deepcopy(self.multiview_sample_infos[idx])
 
         if self.master_system == "as_first_camera":
             # NOTE: shuffle the order of cameras to make the ``first camera`` in training mode not always the same
