@@ -2,6 +2,7 @@ import os
 import random
 import sys
 import time
+from fnmatch import fnmatch
 from pprint import pformat
 from typing import Dict, List, Optional, TypeVar, Union
 
@@ -34,7 +35,7 @@ class Recorder:
         time_f: Optional[float] = None,
         eval_only: bool = False,
     ):
-        self.git_state = self.get_git_state()
+        self.git_state = self.get_git_state(cfg)
         allow_dirty_git = bool(cfg.TRAIN.get("ALLOW_DIRTY_GIT", False))
         if not eval_only:
             assert (
@@ -66,28 +67,29 @@ class Recorder:
         if not self.eval_only and self.exp_id not in ["default", "debug"]:
             logger.info(f"git commit: {self.git_state['commit']}")
         if not self.git_state["is_clean"]:
+            dirty_allowed = self.allow_dirty_git or self.exp_id in ["default", "debug"] or self.eval_only
             dirty_msg = (
-                f"dirty git worktree allowed={self.allow_dirty_git} "
+                f"dirty git worktree allowed={dirty_allowed} "
                 f"modified={len(self.git_state['modified_files'])} "
                 f"staged={len(self.git_state['staged_files'])} "
                 f"untracked={len(self.git_state['untracked_files'])}"
             )
-            if self.allow_dirty_git:
+            if dirty_allowed:
                 logger.warning(dirty_msg)
                 if self.git_state["modified_files"]:
-                    logger.warning(f"modified_files: {' '.join(self.git_state['modified_files'])}")
+                    logger.warning(f"modified_files: {self._format_git_path_list(self.git_state['modified_files'])}")
                 if self.git_state["staged_files"]:
-                    logger.warning(f"staged_files: {' '.join(self.git_state['staged_files'])}")
+                    logger.warning(f"staged_files: {self._format_git_path_list(self.git_state['staged_files'])}")
                 if self.git_state["untracked_files"]:
-                    logger.warning(f"untracked_files: {' '.join(self.git_state['untracked_files'])}")
+                    logger.warning(f"untracked_files: {self._format_git_path_list(self.git_state['untracked_files'])}")
             else:
                 logger.error(dirty_msg)
                 if self.git_state["modified_files"]:
-                    logger.error(f"modified_files: {' '.join(self.git_state['modified_files'])}")
+                    logger.error(f"modified_files: {self._format_git_path_list(self.git_state['modified_files'])}")
                 if self.git_state["staged_files"]:
-                    logger.error(f"staged_files: {' '.join(self.git_state['staged_files'])}")
+                    logger.error(f"staged_files: {self._format_git_path_list(self.git_state['staged_files'])}")
                 if self.git_state["untracked_files"]:
-                    logger.error(f"untracked_files: {' '.join(self.git_state['untracked_files'])}")
+                    logger.error(f"untracked_files: {self._format_git_path_list(self.git_state['untracked_files'])}")
         with open(os.path.join(self.dump_path, "dump_cfg.yaml"), "w") as f:
             f.write(self.cfg.dump(sort_keys=False))
         f.close()
@@ -166,11 +168,14 @@ class Recorder:
         return epoch
 
     @master_only
-    def record_loss(self, loss_metric: LossMetric, epoch: int, comment=""):
+    def record_loss(self, loss_metric: LossMetric, epoch: int, comment="", summary: Optional[str] = None):
         assert self.rank == 0, "only master process can record loss"
         loss_dump_path = os.path.join(self.eval_dump_path, f"{comment}_Loss.txt")
         with open(loss_dump_path, "a") as f:
-            f.write(f"Epoch {epoch} | {comment} loss metric:\n {pformat(loss_metric.get_measures())}\n\n")
+            f.write(f"Epoch {epoch} | {comment} loss metric:\n")
+            if summary:
+                f.write(f"Summary: {summary}\n")
+            f.write(f" {pformat(loss_metric.get_measures())}\n\n")
 
     @master_only
     def record_metric(self, metrics: List, epoch: int, comment="", summary: Optional[str] = None):
@@ -188,8 +193,26 @@ class Recorder:
                 f.write(f"{pformat(M.get_measures())}\n")
             f.write("\n")
 
+    def _format_git_path_list(self, paths: List[str]) -> str:
+        max_items = int(self.cfg.TRAIN.get("GIT_STATUS_LOG_MAX_FILES", 20))
+        if len(paths) <= max_items:
+            return " ".join(paths)
+        preview = " ".join(paths[:max_items])
+        return f"{preview} ... (+{len(paths) - max_items} more)"
+
     @staticmethod
-    def get_git_state() -> Dict[str, Union[Optional[str], List[str], bool]]:
+    def _filter_git_paths(paths: List[str], ignore_patterns: List[str]) -> List[str]:
+        if not ignore_patterns:
+            return paths
+        filtered = []
+        for path in paths:
+            if any(fnmatch(path, pattern) for pattern in ignore_patterns):
+                continue
+            filtered.append(path)
+        return filtered
+
+    @staticmethod
+    def get_git_state(cfg=None) -> Dict[str, Union[Optional[str], List[str], bool]]:
         # get current git report
         proj_root = os.environ.get("PROJECT_ROOT")
         if proj_root is not None:
@@ -197,9 +220,27 @@ class Recorder:
         else:
             repo = Repo(".")
 
+        default_ignore_patterns = [
+            "tmp_debug/**",
+            "tmp_debug_resume/**",
+            "docs/HORT/**",
+            "nohup.out",
+            "scripts/visualize_gigapose_*",
+            "config/release/HOR_HO3Dv3MV_centerrot_*.yaml",
+            "config/release/HOR_HO3Dv3MV_hopregnet_stage1_artiboost_split.yaml",
+            "config/release/HOR_HO3Dv3SV_hopregnet_*.yaml",
+        ]
+        extra_ignore_patterns = []
+        if cfg is not None:
+            extra_ignore_patterns = list(cfg.TRAIN.get("GIT_STATUS_IGNORE_PATTERNS", []))
+        ignore_patterns = default_ignore_patterns + extra_ignore_patterns
+
         modified_files = [item.a_path for item in repo.index.diff(None)]
         staged_files = [item.a_path for item in repo.index.diff("HEAD")]
         untracked_files = repo.untracked_files
+        modified_files = Recorder._filter_git_paths(modified_files, ignore_patterns)
+        staged_files = Recorder._filter_git_paths(staged_files, ignore_patterns)
+        untracked_files = Recorder._filter_git_paths(untracked_files, ignore_patterns)
         is_clean = not (len(modified_files) or len(staged_files) or len(untracked_files))
 
         return {

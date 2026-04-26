@@ -2059,7 +2059,7 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
     
     def on_train_finished(self, recorder: Recorder, epoch_idx, **kwargs):
         comment = f"{self.name}-train"
-        recorder.record_loss(self.loss_metric, epoch_idx, comment=comment)
+        recorder.record_loss(self.loss_metric, epoch_idx, comment=comment, summary=self.format_metric(mode="train"))
         recorder.record_metric([
             self.MPJPE_SV_3D, self.MPVPE_SV_3D,
             self.MPJPE_MASTER_3D, self.MPVPE_MASTER_3D,
@@ -2387,6 +2387,10 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             l_triang = _get_loss('loss_triang')
             l_3d_jts = _get_loss('loss_3d_jts')
             l_2d_proj = _get_loss('loss_2d_proj')
+            l_hand_anat = _get_loss('loss_hand_anatomy')
+            l_hand_twist = _get_loss('loss_hand_twist')
+            l_hand_pose_reg = _get_loss('loss_pose_reg')
+            l_hand_shape_reg = _get_loss('loss_shape_reg')
 
             stage_short = self._stage_display_name(self.current_stage_name, short=True)
             warmup_suffix = f" W{self.current_stage2_warmup:.2f}" if self.current_stage_name == "stage2" and self.current_stage2_warmup < 1.0 else ""
@@ -2395,35 +2399,35 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                 kp_v = self.MPVPE_KP_MASTER_3D.get_result()
                 return (f"{stage_short}{warmup_suffix} | "
                         f"L {l_total:.3f} | "
-                        f"B H/T/J/P {l_hm:.3f}/{l_triang:.3f}/{l_3d_jts:.3f}/{l_2d_proj:.3f} | "
-                        f"SVL I/D/P/S {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f} | "
+                        f"H hm/tri/j2d/prj {l_hm:.3f}/{l_triang:.3f}/{l_3d_jts:.3f}/{l_2d_proj:.3f} | "
+                        f"HP a/t/p/s {l_hand_anat:.3f}/{l_hand_twist:.3f}/{l_hand_pose_reg:.3f}/{l_hand_shape_reg:.3f} | "
+                        f"SV i/d/p/s {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f} | "
                         f"KP {_fmt_mm_pair(kp_j, kp_v)} | "
-                        f"SVTr {_fmt_mm_value(m_sv_obj_trans)} | "
-                        f"RS {_fmt_obj_recon(self.OBJ_RECON_SV)} "
-                        f"RM {_fmt_obj_recon(self.OBJ_RECON_MASTER)}")
+                        f"RST {_fmt_mm_value(m_sv_obj_trans)} | "
+                        f"RS {_fmt_obj_recon(self.OBJ_RECON_SV)}")
             if self.current_stage_name == "stage2":
                 kp_j = self.MPJPE_KP_MASTER_3D.get_result()
                 kp_v = self.MPVPE_KP_MASTER_3D.get_result()
                 return (f"{stage_short}{warmup_suffix} | "
                         f"L {l_total:.3f} | "
-                        f"B H/T/J {l_hm:.3f}/{l_triang:.3f}/{l_3d_jts:.3f} | "
-                        f"SVL I/D/P/S {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f} | "
-                        f"ML A/P {l_obj_master_aux:.3f}/{l_obj_master_points:.3f} | "
+                        f"H hm/tri/j {l_hm:.3f}/{l_triang:.3f}/{l_3d_jts:.3f} | "
+                        f"HP a/t/p/s {l_hand_anat:.3f}/{l_hand_twist:.3f}/{l_hand_pose_reg:.3f}/{l_hand_shape_reg:.3f} | "
+                        f"SV i/d/p/s {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f} | "
+                        f"MO a/p {l_obj_master_aux:.3f}/{l_obj_master_points:.3f} | "
                         f"KP {_fmt_mm_pair(kp_j, kp_v)} | "
-                        f"SVTr {_fmt_mm_value(m_sv_obj_trans)} "
-                        f"MTr {_fmt_mm_value(m_obj_trans)} | "
+                        f"RT s/m {_fmt_mm_value(m_sv_obj_trans)}/{_fmt_mm_value(m_obj_trans)} | "
                         f"RS {_fmt_obj_recon(self.OBJ_RECON_SV)} "
                         f"RM {_fmt_obj_recon(self.OBJ_RECON_MASTER)}")
             kp_j = self.MPJPE_KP_MASTER_3D.get_result()
             kp_v = self.MPVPE_KP_MASTER_3D.get_result()
             return (f"{stage_short}{warmup_suffix} | "
                     f"L {l_total:.3f} | "
-                    f"B H/T/J {l_hm:.3f}/{l_triang:.3f}/{l_3d_jts:.3f} | "
-                    f"SVL I/D/P/S {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f} | "
-                    f"ML A/P {l_obj_master_aux:.3f}/{l_obj_master_points:.3f} | "
+                    f"H hm/tri/j {l_hm:.3f}/{l_triang:.3f}/{l_3d_jts:.3f} | "
+                    f"HP a/t/p/s {l_hand_anat:.3f}/{l_hand_twist:.3f}/{l_hand_pose_reg:.3f}/{l_hand_shape_reg:.3f} | "
+                    f"SV i/d/p/s {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f} | "
+                    f"MO a/p {l_obj_master_aux:.3f}/{l_obj_master_points:.3f} | "
                     f"KP {_fmt_mm_pair(kp_j, kp_v)} | "
-                    f"SVTr {_fmt_mm_value(m_sv_obj_trans)} "
-                    f"MTr {_fmt_mm_value(m_obj_trans)} | "
+                    f"RT s/m {_fmt_mm_value(m_sv_obj_trans)}/{_fmt_mm_value(m_obj_trans)} | "
                     f"RS {_fmt_obj_recon(self.OBJ_RECON_SV)} "
                     f"RM {_fmt_obj_recon(self.OBJ_RECON_MASTER)}")
         elif mode == "test":
@@ -2451,6 +2455,8 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
             l_obj_self = _get_loss("loss_obj_view_rot_self_geo") + _get_loss("loss_obj_view_rot_self_l1")
             l_obj_master_aux = _get_loss("loss_obj_rot") + _get_loss("loss_obj_trans")
             l_obj_master_points = _get_loss("loss_obj_points")
+            l_hand_anat = _get_loss('loss_hand_anatomy')
+            l_hand_twist = _get_loss('loss_hand_twist')
 
             def _fmt_triplet(name, pa_dict, mp, mv):
                 if mp <= 0 and mv <= 0:
@@ -2526,11 +2532,11 @@ class POEM_Heatmap(nn.Module, ModuleAbstract):
                     if self.current_stage_name in ["stage1", "stage2"] else
                     "SVTr -"
                 ),
-                f"SVL I/D/P/S {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f}",
+                f"SV OI/OD/OP/OS {l_obj_init:.3f}/{l_obj_view_direct:.3f}/{l_obj_view_points:.3f}/{l_obj_self:.3f}",
                 (
-                    f"ML A/P {l_obj_master_aux:.3f}/{l_obj_master_points:.3f}"
+                    f"MO Aux/P {l_obj_master_aux:.3f}/{l_obj_master_points:.3f}"
                     if self.current_stage_name == "stage2" else
-                    "ML A/P -/-"
+                    "MO Aux/P -/-"
                 ),
                 f"SVObjSparseRec {_fmt_obj_recon(self.OBJ_RECON_SV)}",
                 f"MasterObjSparseRec {_fmt_obj_recon(self.OBJ_RECON_MASTER)}",
